@@ -1,0 +1,43 @@
+# Copyright 2026 Jeff Long
+# SPDX-License-Identifier: MIT
+#
+# The files the last import from libcapture placed in this tree, one path per line.
+# extract/copy.py writes this file and reads it at the next import.
+uhd/CMakeLists.txt
+uhd/README.md
+uhd/include/capture/uhd/Device.hpp
+uhd/include/capture/uhd/Discovery.hpp
+uhd/include/capture/uhd/KNOWLEDGE.md
+uhd/include/capture/uhd/Sink.hpp
+uhd/include/capture/uhd/Source.hpp
+uhd/include/gnuradio-4.0/capture/uhd/UhdBlocks.hpp
+uhd/test/hw_uhd.cpp
+uhd/test/qa_controls_uhd.cpp
+uhd/test/qa_discovery_library_uhd.cpp
+uhd/test/qa_discovery_uhd.cpp
+uhd/test/qa_sink_uhd.cpp
+CMakeLists.txt
+LICENSE
+LICENSES/MIT.txt
+README.md
+REUSE.toml
+common/cmake/capture.cmake
+common/include/capture/common/ControlDesc.hpp
+common/include/capture/common/CoreListing.hpp
+common/include/capture/common/Device.hpp
+common/include/capture/common/Discovery.hpp
+common/include/capture/common/DiscoveryLibrary.hpp
+common/include/capture/common/Env.hpp
+common/include/capture/common/KNOWLEDGE.md
+common/include/capture/common/Properties.hpp
+common/include/capture/common/Ring.hpp
+common/include/capture/common/Sink.hpp
+common/include/capture/common/Source.hpp
+common/include/capture/common/Threading.hpp
+common/src/common/DiscoveryLibrary.cpp
+common/test/support/Cases.hpp
+common/test/support/Held.hpp
+common/test/support/Labels.hpp
+common/test/support/Readings.hpp
+common/test/support/ScheduledGraph.hpp
+common/test/support/Surface.hpp
