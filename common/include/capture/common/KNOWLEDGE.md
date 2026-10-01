@@ -571,10 +571,14 @@ request and calls `processScheduledMessages()` on the model from its own thread.
   `gain_mode` the same way, true for any value but zero, where the surface the block states
   carries the descriptor, and is refused as an unknown id where it does not.
 - `sensors` answers Get with `{sensors: [reading, ...]}`: the stream state first, then
-  `readSensors()`. A request carrying `{sweep: "full"}` takes a family's full sweep, and the
-  brief sweep answers otherwise. A block whose device is down answers the stream state alone,
-  and a block whose device is up and did not answer the sweep answers an error. A subscriber receives every set a Get produces for another client.
-  Subscribe and Unsubscribe take no reply.
+  `readSensors()`, or `cachedSensors()` where a block keeps a cache. A request carrying
+  `{sweep: "full"}` asks for a family's full sweep, and for the brief sweep otherwise. A cached
+  answer of either kind carries the newest reading of each id that any sweep has landed, and
+  the sweep the request queues lands for a later request. A full request made before any full
+  sweep has landed answers the brief readings and `sensors_whole_pending`. A block whose
+  device is down answers the stream state alone, and a block whose device is up and did not
+  answer the sweep answers an error. A subscriber receives every set a Get produces for
+  another client. Subscribe and Unsubscribe take no reply.
 - `devices` answers Get with `{devices: [{label, selector}, ...], opens}` from the family's
   `enumerateDevices()`. `kListingOpens` on every block says whether that listing opens a unit
   to name it; such a family lists nothing unless the request carries `{allow_open: true}`, and

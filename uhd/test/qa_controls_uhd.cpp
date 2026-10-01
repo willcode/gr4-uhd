@@ -34,6 +34,7 @@
 #include <chrono>
 #include <cmath>
 #include <complex>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>
@@ -42,6 +43,7 @@
 #include <future>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -2082,6 +2084,132 @@ int main(int argc, char** argv) {
         expect(blk.state() == gr::lifecycle::State::ERROR) << "and the block is left in ERROR";
         expect(blk._usrp == nullptr && blk._stream == nullptr && !blk.deviceUp()) << "holding no device and no streamer";
         expect(!blk.hardwareTeardown()) << "with nothing left for a teardown to release";
+    });
+
+    cases("controls.uhd-a-sensors-read-answers-from-the-cache", [] {
+        /*| frame: the cache holds a scripted sweep in place of a device. Each sweep stamps its
+                readings with its own number, a whole sweep waits for the case's word, and every
+                sweep records the thread it ran on. A brief sweep alone writes brief_sweeps, the
+                count of brief sweeps run. No device is opened.
+        */
+        using Sweep = capture::uhd::SensorSweep;
+        std::mutex                   gate;
+        std::condition_variable      moved;
+        bool                         release = false;
+        int                          swept   = 0;  // under gate
+        int                          briefs  = 0;  // under gate
+        std::vector<std::thread::id> wholeOn;      // under gate
+        std::vector<std::thread::id> briefOn;      // under gate
+        const auto                   value = [](const std::vector<capture::SensorReading>& readings, std::string_view id) {
+            const auto at = std::ranges::find_if(readings, [id](const capture::SensorReading& r) { return r.id == id; });
+            return at == readings.end() ? std::string{} : at->value;
+        };
+        const auto script = [&](std::vector<capture::SensorReading>& out, Sweep kind) {
+            std::unique_lock lock(gate);
+            if (kind == Sweep::Full) {
+                moved.wait(lock, [&release] { return release; });
+            }
+            const int n = ++swept;
+            (kind == Sweep::Full ? wholeOn : briefOn).push_back(std::this_thread::get_id());
+            out.push_back({.id = "ref_locked", .label = "Reference lock", .value = std::format("sweep {}", n), .good = true, .brief = true});
+            if (kind == Sweep::Full) {
+                out.push_back({.id = "gps_time", .label = "GPS epoch time", .value = std::format("sweep {}", n), .good = true, .brief = true});
+            } else {
+                out.push_back({.id = "brief_sweeps", .label = "Brief sweeps", .value = std::format("{}", ++briefs), .good = true, .brief = true});
+            }
+            return true;
+        };
+        const auto self = std::this_thread::get_id();
+        /*| frame: asks until the answer's reading differs from the one given, which is the sweep
+                an earlier answer queued landing. */
+        const auto askUntil = [](capture::uhd::SensorCache& c, Sweep kind, std::string_view id, const std::string& from, auto&& valueOf) {
+            capture::uhd::SensorCache::Answer got;
+            const auto                        deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (std::chrono::steady_clock::now() < deadline) {
+                got = c.answer(kind);
+                if (!got.wholePending && valueOf(got.readings, id) != from) {
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            return got;
+        };
+
+        capture::uhd::SensorCache cache;
+        cache.start("case", script);
+        expect(cache.fill(Sweep::Brief)) << "a fill sweeps on the calling thread and keeps what it read";
+        const auto first = cache.answer(Sweep::Full);
+        expect(first.wholePending) << "a whole answer before any whole sweep has landed states the whole set pending";
+        expect(value(first.readings, "ref_locked") == "sweep 1" && value(first.readings, "gps_time").empty()) << "and carries the brief readings";
+        {
+            std::lock_guard lock(gate);
+            expect(wholeOn.empty()) << "the answer returned while the whole sweep it queued waits for the device";
+            release = true;
+        }
+        moved.notify_all();
+
+        const auto landed = askUntil(cache, Sweep::Full, "gps_time", std::string{}, value);
+        expect(!landed.wholePending && !value(landed.readings, "gps_time").empty()) << "the queued whole sweep lands, and a whole answer after it carries the whole set";
+        const auto brief  = cache.answer(Sweep::Brief);
+        expect(!brief.wholePending && !value(brief.readings, "gps_time").empty()) << "a brief answer carries every reading held, the whole sweep's gps_time among them";
+        const auto later = askUntil(cache, Sweep::Brief, "brief_sweeps", value(brief.readings, "brief_sweeps"), value);
+        expect(value(later.readings, "brief_sweeps") != value(brief.readings, "brief_sweeps")) << "the brief sweep a brief answer queued lands for a later one";
+        cache.stop();
+        {
+            std::lock_guard lock(gate);
+            expect(!wholeOn.empty() && std::ranges::none_of(wholeOn, [self](std::thread::id id) { return id == self; })) << "every whole sweep ran on the cache's thread";
+            expect(briefOn.size() >= 2UZ && briefOn.front() == self) << "the fill on the caller's, and at least one brief sweep an answer queued beside it";
+            expect(std::ranges::none_of(briefOn.begin() + 1, briefOn.end(), [self](std::thread::id id) { return id == self; })) << "every sweep an answer queued ran on the cache's thread";
+        }
+        const auto after = cache.answer(Sweep::Full);
+        expect(after.readings.empty() && after.wholePending) << "a stop empties the cache";
+
+        /*| frame: a whole sweep reads gps_locked unlocked, and a brief sweep after it reads it
+                locked. The newest reading of each id answers a request of either kind, whatever
+                kind of sweep read it. */
+        capture::uhd::SensorCache order;
+        bool                      locked = false;
+        order.start("case", [&locked](std::vector<capture::SensorReading>& out, Sweep kind) {
+            out.push_back({.id = "gps_locked", .label = "GPS lock", .value = locked ? "locked" : "unlocked", .good = locked, .brief = true});
+            if (kind == Sweep::Full) {
+                out.push_back({.id = "gps_time", .label = "GPS epoch time", .value = "1790000000 seconds", .good = true, .brief = true});
+            }
+            return true;
+        });
+        expect(order.fill(Sweep::Full));
+        locked = true;
+        expect(order.fill(Sweep::Brief));
+        const auto merged = order.answer(Sweep::Full);
+        expect(value(merged.readings, "gps_locked") == "locked") << "a whole answer carries the brief sweep's newer lock reading";
+        expect(value(merged.readings, "gps_time") == "1790000000 seconds") << "beside the whole sweep's own rows";
+        const auto briefMerged = order.answer(Sweep::Brief);
+        expect(value(briefMerged.readings, "gps_locked") == "locked" && value(briefMerged.readings, "gps_time") == "1790000000 seconds") << "a brief answer carries the same held set, the whole-only gps_time included";
+        order.stop();
+
+        /*| frame: the block's own path, with no device open: the cache filled by a script and
+                the device marked up, so the property's answer can come from the cache alone. A
+                sweep of the device itself finds no handle and fails. */
+        capture::uhd::Source src{};
+        src._sensorCache.start("case", [](std::vector<capture::SensorReading>& out, Sweep kind) {
+            out.push_back({.id = "ref_locked", .label = "Reference lock", .value = kind == Sweep::Full ? "whole" : "brief", .good = true, .brief = true});
+            return true;
+        });
+        expect(src._sensorCache.fill(Sweep::Brief));
+        src._deviceUp.store(true, std::memory_order_release);
+        std::vector<capture::SensorReading> direct;
+        expect(src.cachedSensors(direct, Sweep::Full)) << "cachedSensors answers while the device is up";
+        expect(value(direct, "ref_locked") == "brief" && !value(direct, capture::kSensorsWholePendingReading).empty()) << "with the brief readings and the whole set pending";
+        expect(!value(direct, "rx_overflows").empty()) << "and the block's own readings beside them";
+        gr::Message request;
+        request.cmd      = gr::message::Command::Get;
+        request.endpoint = capture::property::kSensors;
+        request.data     = gr::property_map{{"sweep", std::string("full")}};
+        const auto reply = capture::answerControlProperty(src, capture::property::kSensors, std::move(request));
+        expect(fatal(reply.has_value() && reply->data.has_value())) << "the sensors property answers a block with no device handle";
+        const auto answered = capture::sensorsFromReply(*reply->data);
+        expect(value(answered, "ref_locked") == "brief" || value(answered, "ref_locked") == "whole") << "from the cache, which a sweep of the device could not have answered";
+        src._deviceUp.store(false, std::memory_order_release);
+        src._sensorCache.stop();
     });
 
     cases("controls.uhd-a-thread-that-does-not-start-ends-the-start", [] {

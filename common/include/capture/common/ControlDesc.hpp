@@ -414,6 +414,12 @@ inline constexpr const char* kStreamStateReading     = "rx_stream_state";
 inline constexpr const char* kTxStreamStateReading   = "tx_stream_state";
 inline constexpr const char* kAnalogBandwidthReading = "rx_analog_bandwidth";
 
+/*| contract: the id of the reading a block that answers the sensors property from a cache adds
+        to a whole answer made before a whole sweep has landed. Such an answer carries the brief
+        readings, and a later whole request receives the whole set.
+*/
+inline constexpr const char* kSensorsWholePendingReading = "sensors_whole_pending";
+
 /*| contract: the words of the stream state. stopped, the block holds no stream: it has not
         started, or it has stopped. starting, the block is running and its start has not yet
         put the stream in place. streaming, the device is up and delivering. paused, a sink

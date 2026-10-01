@@ -38,6 +38,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <format>
+#include <functional>
 #include <iterator>
 #include <limits>
 #include <mutex>
@@ -54,6 +55,92 @@
 #include <vector>
 
 namespace capture::uhd {
+
+/*| role: the sensor readings a running source answers the sensors property with, and the thread
+        of the source's own that refreshes them.
+    contract: answer(kind) returns at once and queues a sweep of that kind on the cache's
+        thread; a request for a kind already queued and not begun replaces it. Every sweep merges
+        into one held set by id, so each reading held is the newest any sweep brought. An answer
+        of either kind is the held set, whole-only readings included. The kind names the sweep
+        the answer queues. A whole answer before any whole sweep has landed carries the brief
+        readings and states the whole set pending. fill(kind) runs one sweep on the calling
+        thread, merges what it read, and answers whether the sweep answered. start() takes the
+        sweep and runs the thread. stop() drops a queued sweep, waits for a running one, joins
+        the thread and empties the cache.
+    invariant: no sweep runs inside answer(). The held set moves in and out under the mutex of a
+        Snapshot, which no sweep holds. One fill runs at a time, so the sweeps merge in the order
+        they ran.
+    why: the framework answers a property message on the worker that runs the block, between
+        two of its work calls, and nothing reaches the output while the answer is made. A whole
+        sweep there holds the stream for as long as a disciplined oscillator's epoch-time
+        sensor waits for its next serial sentence, up to a second.
+    trap: a whole answer that kept the whole sweep's rows apart would carry lock readings one
+        whole sweep old over a brief sweep's newer ones, and a reader comparing successive
+        answers would see a lock lost and found again.
+    trap: a brief answer that left out the whole-only readings would hold a whole sweep's epoch
+        time back until the next whole request. A reader that asks for the whole set every
+        fourth time would receive that time three requests late.
+    verified-by: controls.uhd-a-sensors-read-answers-from-the-cache
+*/
+class SensorCache {
+public:
+    using Sweep = std::function<bool(std::vector<SensorReading>&, SensorSweep)>;
+
+    struct Answer {
+        std::vector<SensorReading> readings;
+        bool                       wholePending = false;
+    };
+
+    void start(std::string_view blockName, Sweep sweep) {
+        _worker.stop();
+        _sweep = std::move(sweep);
+        _worker.start("uhdsens", blockName);
+    }
+
+    void stop() {
+        _worker.stop();
+        _values.publish({});
+    }
+
+    bool fill(SensorSweep kind) {
+        std::lock_guard            sweeping(_sweepMutex);
+        std::vector<SensorReading> out;
+        if (!_sweep || !_sweep(out, kind)) {
+            return false;
+        }
+        Values held = _values.read();
+        for (SensorReading& r : out) {
+            const auto at = std::ranges::find(held.rows, r.id, &SensorReading::id);
+            if (at == held.rows.end()) {
+                held.rows.push_back(std::move(r));
+            } else {
+                *at = std::move(r);
+            }
+        }
+        held.haveWhole = held.haveWhole || kind == SensorSweep::Full;
+        _values.publish(std::move(held));
+        return true;
+    }
+
+    [[nodiscard]] Answer answer(SensorSweep kind) {
+        const Values held = _values.read();
+        _worker.post(kind == SensorSweep::Full ? kWholeKey : kBriefKey, [this, kind] { std::ignore = fill(kind); });
+        return {.readings = held.rows, .wholePending = kind == SensorSweep::Full && !held.haveWhole};
+    }
+
+private:
+    struct Values {
+        std::vector<SensorReading> rows;
+        bool                       haveWhole = false;
+    };
+    static constexpr int kBriefKey = 0;
+    static constexpr int kWholeKey = 1;
+
+    Snapshot<Values> _values;
+    std::mutex       _sweepMutex; // one fill at a time, so the sweeps merge in the order they ran
+    Sweep            _sweep;
+    ControlWorker    _worker;
+};
 
 /*| role: the USRP source for Ettus radios, over libuhd.
     contract: the settings below, receives made into the output edge itself, and a
@@ -165,6 +252,11 @@ use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in the environment.)">;
             tunes at 2 MS/s shed 2.8 s of signal behind 14 markers.
     */
     ControlWorker               _control;
+    /*| frame: the readings the sensors property answers with, and the thread that sweeps the
+            device for them. It runs from the start that opened the device to the teardown that
+            releases it, beside the control thread.
+    */
+    SensorCache                 _sensorCache;
     static constexpr int        kControlFrequency = 0;
     static constexpr int        kControlGain      = 1;
     static constexpr int        kControlAgc       = 2;
@@ -1332,8 +1424,9 @@ use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in the environment.)">;
     using SensorSweep = capture::uhd::SensorSweep;
 
     /*| contract: read the sensors the open device publishes, plus the reference and timing
-            state that is not a sensor but belongs beside them. False, publishing nothing, when
-            no device is up or the device goes down mid-sweep. Full is every sensor; Brief is
+            state that is not a sensor but belongs beside them, on the calling thread. False,
+            publishing nothing, when no device is up or the device goes down mid-sweep. The
+            sensors property answers from cachedSensors instead. Full is every sensor; Brief is
             the ones start() measured as cheap, and the default is Full so a caller that says
             nothing gets what it always got.
         frame: these are control-plane reads over the same transport the settings appliers use,
@@ -1356,6 +1449,43 @@ use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in the environment.)">;
             so teardown waits for one sensor rather than a whole sweep.
     */
     bool readSensors(std::vector<SensorReading>& out, SensorSweep sweepKind = SensorSweep::Full) const {
+        if (!sweepDevice(out, sweepKind)) {
+            return false;
+        }
+        appendBlockReadings(out);
+        return true;
+    }
+
+    /*| contract: the sensors property's answer: the sensor cache's answer, the newest reading
+            of each id any sweep has landed, and the block's own readings. It makes no device
+            call. It waits only for a control write that holds the control mutex. It queues a
+            sweep of the kind asked for on the cache's thread. A reading reaches the first
+            request of either kind made after its sweep lands, which is a later request than
+            the one that queued the sweep. The first request after a start answers the brief
+            sweep the start made. A whole request made before any whole sweep has landed
+            answers the brief readings and a reading kSensorsWholePendingReading. False,
+            publishing nothing, when no device is up.
+        verified-by: controls.uhd-a-sensors-read-answers-from-the-cache
+        verified-by: uhd.sensor-sweep-beside-a-stream
+    */
+    bool cachedSensors(std::vector<SensorReading>& out, SensorSweep sweepKind) {
+        out.clear();
+        if (!_deviceUp.load(std::memory_order_acquire)) {
+            return false;
+        }
+        SensorCache::Answer held = _sensorCache.answer(sweepKind);
+        out                      = std::move(held.readings);
+        appendBlockReadings(out);
+        if (held.wholePending) {
+            out.push_back({.id = kSensorsWholePendingReading, .label = "Whole reading set", .value = "pending", .good = true, .brief = false});
+        }
+        return true;
+    }
+
+    /*| contract: one sweep of the device's own readings, the kind asked for, on the calling
+            thread, as readSensors states it and without the block's own readings.
+    */
+    bool sweepDevice(std::vector<SensorReading>& out, SensorSweep sweepKind) const {
         out.clear();
         std::lock_guard             sweep(_sensorMutex);
         ::uhd::usrp::multi_usrp::sptr usrp;
@@ -1368,9 +1498,11 @@ use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in the environment.)">;
             usrp  = _usrp; // shared: the device outlives a teardown that races this sweep
             names = _sensorNames;
         }
-        if (usrp == nullptr || !readDeviceSensors(out, *usrp, names, Direction::Receive, sweepKind, [this] { return _deviceUp.load(std::memory_order_acquire); })) {
-            return false;
-        }
+        return usrp != nullptr && readDeviceSensors(out, *usrp, names, Direction::Receive, sweepKind, [this] { return _deviceUp.load(std::memory_order_acquire); });
+    }
+
+    // The readings the block states itself beside a sweep, which read no device.
+    void appendBlockReadings(std::vector<SensorReading>& out) const {
         appendReadings(out);
         /*| frame: what the unit is, which no sensor reports, read once when the device was
                 opened, so it costs a poll nothing. It is a diagnostic.
@@ -1378,7 +1510,6 @@ use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in the environment.)">;
         if (const std::string what = identity(); !what.empty()) {
             out.push_back({.id = "device_model", .label = "Device", .value = what, .good = true, .brief = false});
         }
-        return true;
     }
 
     /*| contract: what this stream has lost, beside the device's own sensors, because a receiver
@@ -1620,6 +1751,9 @@ use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in the environment.)">;
 
         _deviceUp.store(true, std::memory_order_release);
         startThreads();
+        /*| frame: the brief sweep the first sensors request answers with, made here on an
+                open device and before the first answer. */
+        std::ignore = _sensorCache.fill(SensorSweep::Brief);
         offerControlProperties(*this);
     }
 
@@ -1634,14 +1768,15 @@ use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in the environment.)">;
         throwStartFailure("uhd::Source", reason, where);
     }
 
-    /*| contract: start the control thread and then the consumer thread on the open device. A
-            thread the system does not start ends the start through failStartOnOpenDevice, which
-            joins the control thread where it is running.
+    /*| contract: start the control thread, the sensor cache's thread and then the consumer thread
+            on the open device. A thread the system does not start ends the start through
+            failStartOnOpenDevice, which joins the threads that are running.
         verified-by: controls.uhd-a-thread-that-does-not-start-ends-the-start
     */
     void startThreads() {
         try {
             _control.start("uhdctl", this->name.value);
+            _sensorCache.start(this->name.value, [this](std::vector<SensorReading>& out, SensorSweep kind) { return sweepDevice(out, kind); });
             _consumer.clearStop();
             _consumer.thread = std::thread([this, priority = thread_priority.value, processor = cpu.value] {
                 nameStreamingThread("uhd", this->name.value);
@@ -1689,9 +1824,12 @@ use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in the environment.)">;
             milliseconds in the ordinary one — the consumer's receive in flight, at most
             0.1 s, and then the drain, at most 0.3 s. A receiver reaches stop() from the
             thread that serves its interface, so that wait is the interface's.
-        trap: longer only where one receive overruns its own timeout, which the vendor
-            allows: the timeout applies to every internal call inside recv rather than to the
-            whole of it.
+        trap: longer where one receive overruns its own timeout, which the vendor allows: the
+            timeout applies to every internal call inside recv rather than to the whole of it.
+            Longer also by the sensor read in flight on the sensor cache's thread, which the
+            cache's stop waits for: a GPSDO's gps_time read waits up to about a second for its
+            next sentence. The wait stays because that read holds the device handle, and the
+            device is released only after it.
         verified-by: uhd.stop-latency
     */
     bool hardwareTeardown() {
@@ -1701,6 +1839,8 @@ use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in the environment.)">;
         _consumer.requestStop();
         // Ahead of the join: a consumer waiting for the control thread to settle is let go.
         _control.stop();
+        // A sweep in flight aborts at its next read, since _deviceUp is already false.
+        _sensorCache.stop();
         _consumer.joinIfRunning();
         if (_stream != nullptr) {
             std::ignore = stopAndDrainStream();

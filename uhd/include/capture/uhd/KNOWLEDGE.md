@@ -354,8 +354,17 @@ clock per rate and the other divides a fixed clock, one carries a filter from 20
 daughterboard while the other keeps them under the converter core.
 
 A full sensor sweep waits on a disciplined oscillator's serial link for most of a second. The
-transmit queue at 61.44 MS/s is 128 MiB of CF32, and a rate change down replaces the storage,
-which gives that memory back.
+scheduler answers a property message on the worker that runs the block, between two of its work
+calls, so a sweep made there stops delivery for its length: on an N210 with a GPSDO at 10 MS/s,
+0.1 to 0.8 s per full sweep, with no sample lost. The receive block therefore answers the
+`sensors` property from a cache and sweeps on a thread of its own, the kind each request asks
+for landing for a later request. Every sweep merges into the cache by id, and an answer of
+either kind carries every reading the cache holds. A full answer carries the newest lock
+readings a brief sweep brought, and a brief answer carries the epoch time the last full sweep
+read. Asked every second, a full sweep every fourth request, the stream kept every sample, and
+no delivery gap reached 5 ms (`uhd.sensor-sweep-beside-a-stream`). The transmit block sweeps on the worker. The transmit
+queue at 61.44 MS/s is 128 MiB of CF32, and a rate change down replaces the storage, which
+gives that memory back.
 
 The USRP families UHD 4.9.0.1 builds support for, the links each offers, the fastest rate per
 channel, the channel count, and the link rate UHD states in `/mboards/0/link_max_rate`. A

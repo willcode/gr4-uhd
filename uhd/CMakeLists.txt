@@ -62,6 +62,7 @@ if(CAPTURE_UHD_FOUND)
           controls.uhd-bounds-the-lo-offset controls.uhd-a-silent-receive-counts-whatever-it-says
           controls.uhd-a-gap-marker-names-its-cause controls.uhd-an-unconnected-output-ends-the-block controls.uhd-a-failed-start-throws
           controls.uhd-a-thread-that-does-not-start-ends-the-start
+          controls.uhd-a-sensors-read-answers-from-the-cache
           controls.uhd-a-retune-forwards-nothing-ahead-of-its-samples controls.uhd-a-retune-tag-lands-on-the-first-sample-it-reached
           controls.uhd-an-overflow-during-a-retune-is-named-for-it controls.uhd-a-shed-no-counter-explains-is-marked
           controls.uhd-stamps-off-the-sample-grid-count-only-lost-samples
@@ -185,6 +186,7 @@ if(CAPTURE_HW_UHD AND CAPTURE_UHD_FOUND)
   set(CAPTURE_HW_UHD_CASES
       uhd.open-stream-close uhd.rate-ladder uhd.tuning-and-range uhd.frequency-correction-sign
       uhd.gain uhd.hardware-information uhd.agc uhd.antenna uhd.analog-bandwidth uhd.sensors
+      uhd.sensor-sweep-beside-a-stream
       uhd.overflow-under-a-stalled-consumer uhd.teardown-and-restart uhd.corrections
       uhd.correction-defaults uhd.device-string-keys uhd.clock-and-time-source
       uhd.reference-lock-wait uhd.lo-offset uhd.device-time uhd.device-time-source

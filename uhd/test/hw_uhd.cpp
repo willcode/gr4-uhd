@@ -14,6 +14,7 @@
         under CAPTURE_HW_UHD, so the hardware-free suite never reaches one. The device
         selector comes from CAPTURE_HW_UHD_ARGS and names one unit by serial otherwise.
 */
+#include <capture/common/Properties.hpp>
 #include <capture/uhd/Sink.hpp>
 #include <capture/uhd/Source.hpp>
 
@@ -65,6 +66,19 @@ std::atomic<bool>          g_stallTaken{false};
 // recorder hear that the radio moved.
 std::atomic<std::uint64_t> g_rateTags{0};
 std::atomic<double>        g_lastRateTagHz{0.0};
+
+/*| frame: the delivery gaps the consumer saw while a case watches for them: the steady-clock
+        time of the last delivery, the longest interval between two deliveries, and every
+        interval longer than kGapNs as its two ends. A gap is a stretch in which the source
+        handed nothing downstream, and a receiver's outputs stop for as long.
+*/
+constexpr std::uint64_t                           kGapNs = 20'000'000UL;
+std::atomic<bool>                                 g_gapWatch{false};
+std::atomic<std::uint64_t>                        g_lastDeliveryNs{0};
+std::atomic<std::uint64_t>                        g_longestGapNs{0};
+std::vector<std::pair<std::uint64_t, std::uint64_t>> g_gaps; // under g_tagLock
+
+std::uint64_t steadyNs() { return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()); }
 
 /*| role: what the arriving samples add up to, over whatever window a case resets around.
     frame: three quantities from one pass — the mean power, the mean sample (the DC
@@ -143,6 +157,10 @@ void resetCounters() {
     std::lock_guard g(g_tagLock);
     g_tagTimes.clear();
     g_markerAt.clear();
+    g_gaps.clear();
+    g_gapWatch.store(false);
+    g_lastDeliveryNs.store(0);
+    g_longestGapNs.store(0);
 }
 
 void resetPower() { g_accum.reset(); }
@@ -218,6 +236,20 @@ struct [[maybe_unused]] hw_sink : gr::Block<hw_sink> {
         }
         g_accum.add(std::span<const CF32>(inSpan.data(), n));
         g_samples.fetch_add(n, std::memory_order_relaxed);
+        if (g_gapWatch.load(std::memory_order_relaxed)) {
+            const std::uint64_t now  = steadyNs();
+            const std::uint64_t prev = g_lastDeliveryNs.exchange(now, std::memory_order_relaxed);
+            if (prev != 0UL && now > prev) {
+                const std::uint64_t gap = now - prev;
+                if (gap > g_longestGapNs.load(std::memory_order_relaxed)) {
+                    g_longestGapNs.store(gap, std::memory_order_relaxed);
+                }
+                if (gap > kGapNs) {
+                    std::lock_guard g(g_tagLock);
+                    g_gaps.emplace_back(prev, now);
+                }
+            }
+        }
 
         if (const std::int64_t ms = g_stallMs.load(std::memory_order_relaxed); ms > 0 && !g_stallTaken.exchange(true)) {
             std::this_thread::sleep_for(std::chrono::milliseconds(ms));
@@ -1367,6 +1399,267 @@ int main(int argc, char** argv) {
         }
         expect(sawFalse) << "a sweep against a device going down answers false";
         expect(falseIsEmpty) << "and publishes nothing rather than a partial set";
+    });
+
+    cases("uhd.sensor-sweep-beside-a-stream", [] {
+        /*| frame: a receiver streams and reads the sensors on a thread of its own, the whole
+                set every few seconds and the brief set every second. One stream carries six
+                arms of equal length: first the property asked every second for the whole set
+                every fourth time, as a receiver's poller asks from a start, then the whole sweep
+                every 4.7 s and the brief sweep every second, each called on a thread of the
+                case's own and each asked through the sensors property, and no sweep. Each arm
+                states the overflow events, the dropped samples and the sequence errors the
+                source counted, the wall time of each sweep or answer, and the delivery gaps the
+                consumer saw, with the number that overlap a sweep. A closing arm stalls the
+                consumer for two seconds, and its gap and loss counts show that the watch sees a
+                stall.
+            frame: the scheduler answers a property message on the worker that runs the block,
+                between two of the block's work calls. The source answers from its sensor
+                cache there and sweeps the device on a thread of its own.
+            contract: the arm without a sweep loses nothing, and every arm that asks through
+                the property loses nothing and keeps its longest delivery gap under the gap
+                watch's threshold. A whole answer states the whole set pending until a whole
+                sweep has landed, and the every-fourth arm receives the whole set. The arms that
+                call the sweep directly are measured and printed, because what a sweep costs a
+                stream from another thread is a property of the unit.
+            why: the rate is the ladder's entry at or below 10 MS/s, which the rate ladder
+                streams without loss, so a loss in a sweeping arm belongs to the sweep.
+            why: the gap bound is the gap watch's threshold. The stall it guards against lasts
+                a tenth of a second or more, and a bound a few milliseconds wide fails on a busy
+                host while the cache works.
+        */
+        using Sweep = capture::uhd::Source::SensorSweep;
+        struct Arm {
+            const char*   name;
+            bool          sweeps;
+            bool          asked;
+            Sweep         kind;
+            int           periodMs;
+            int           wholeEvery = 0;
+            std::uint64_t unanswered = 0;
+            std::uint64_t pending    = 0;
+            std::uint64_t wholeSets  = 0;
+            std::uint64_t overflows = 0;
+            std::uint64_t dropped   = 0;
+            std::uint64_t seqErrors = 0;
+            std::uint64_t markers   = 0;
+            std::uint64_t samples   = 0;
+            double        seconds   = 0.0;
+            double        longestGapMs = 0.0;
+            std::vector<double>                                   sweepMs{};
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> windows{};
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> gaps{};
+        };
+        constexpr auto kArm     = std::chrono::seconds(20);
+        constexpr int  kStallMs = 2000;
+        std::vector<Arm> arms{{.name = "asked 1 s, whole every 4th", .sweeps = true, .asked = true, .kind = Sweep::Brief, .periodMs = 1000, .wholeEvery = 4},
+                              {.name = "whole every 4.7 s", .sweeps = true, .asked = false, .kind = Sweep::Full, .periodMs = 4700},
+                              {.name = "no sweep", .sweeps = false, .asked = false, .kind = Sweep::Full, .periodMs = 0},
+                              {.name = "brief every 1 s", .sweeps = true, .asked = false, .kind = Sweep::Brief, .periodMs = 1000},
+                              {.name = "asked whole every 4.7 s", .sweeps = true, .asked = true, .kind = Sweep::Full, .periodMs = 4700},
+                              {.name = "asked brief every 1 s", .sweeps = true, .asked = true, .kind = Sweep::Brief, .periodMs = 1000}};
+        Arm stall{.name = "consumer stalled 2 s", .sweeps = false, .asked = false, .kind = Sweep::Full, .periodMs = 0};
+
+        const auto& truth  = benchTruth();
+        const auto  ladder = capture::uhd::Source::sampleRatesFor(truth);
+        double      kRate  = ladder.empty() ? 2.0e6 : ladder.front();
+        for (const double r : ladder) {
+            if (r <= 10.0e6) {
+                kRate = std::max(kRate, r);
+            }
+        }
+        double                                      rateInForce = 0.0;
+        std::vector<std::pair<std::string, double>> perSensorMs;
+
+        const auto measure = [](capture::uhd::Source& src, Arm& arm, auto&& during) {
+            const std::uint64_t ov0  = src.overflowEvents();
+            const std::uint64_t dr0  = src.droppedSamples();
+            const std::uint64_t sq0  = src.sequenceErrors();
+            const std::uint64_t mk0  = g_overflowTags.load();
+            const std::uint64_t at0  = g_samples.load();
+            {
+                std::lock_guard g(g_tagLock);
+                g_gaps.clear();
+            }
+            g_longestGapNs.store(0);
+            /*| frame: the watch opens as a delivery, so a sweep that starts with the arm is a gap
+                    like any other. */
+            g_lastDeliveryNs.store(steadyNs());
+            g_gapWatch.store(true);
+            const auto t0 = Clock::now();
+            during();
+            g_gapWatch.store(false);
+            arm.seconds      = std::chrono::duration<double>(Clock::now() - t0).count();
+            arm.overflows    = src.overflowEvents() - ov0;
+            arm.dropped      = src.droppedSamples() - dr0;
+            arm.seqErrors    = src.sequenceErrors() - sq0;
+            arm.markers      = g_overflowTags.load() - mk0;
+            arm.samples      = g_samples.load() - at0;
+            arm.longestGapMs = static_cast<double>(g_longestGapNs.load()) / 1e6;
+            std::lock_guard g(g_tagLock);
+            arm.gaps = g_gaps;
+        };
+
+        const bool ran = withGraph(sourceSettings(kRate, defaultFreq(), truth.gainMinDb, sourcePort()), [&](capture::uhd::Source& src, auto& scheduled) {
+            expect(waitForSamples(std::chrono::milliseconds(8000))) << "the stream starts";
+            settle(1000);
+            rateInForce = deviceRead(src, 0.0, [](uhd::usrp::multi_usrp& u) { return u.get_rx_rate(0); });
+
+            /*| frame: the cost of each read a whole sweep makes, one at a time through the
+                    block's own handle, taken before the arms so it adds nothing to them. */
+            const auto mboardNames = deviceRead(src, std::vector<std::string>{}, [](uhd::usrp::multi_usrp& u) { return u.get_mboard_sensor_names(0); });
+            const auto rxNames     = deviceRead(src, std::vector<std::string>{}, [](uhd::usrp::multi_usrp& u) { return u.get_rx_sensor_names(0); });
+            const auto timeOne     = [&src, &perSensorMs](const std::string& id, auto&& read) {
+                const auto   at = Clock::now();
+                const double ms = deviceRead(src, -1.0, [&read, &at](uhd::usrp::multi_usrp& u) {
+                    read(u);
+                    return std::chrono::duration<double, std::milli>(Clock::now() - at).count();
+                });
+                perSensorMs.emplace_back(id, ms);
+            };
+            for (const std::string& n : mboardNames) {
+                timeOne(n, [&n](uhd::usrp::multi_usrp& u) { std::ignore = u.get_mboard_sensor(n, 0); });
+            }
+            for (const std::string& n : rxNames) {
+                timeOne(n, [&n](uhd::usrp::multi_usrp& u) { std::ignore = u.get_rx_sensor(n, 0); });
+            }
+            timeOne("clock_source", [](uhd::usrp::multi_usrp& u) { std::ignore = u.get_clock_source(0); });
+            timeOne("time_source", [](uhd::usrp::multi_usrp& u) { std::ignore = u.get_time_source(0); });
+            timeOne("time_last_pps", [](uhd::usrp::multi_usrp& u) { std::ignore = u.get_time_last_pps(0); });
+            settle(1000);
+
+            std::size_t requests = 0UZ;
+            for (Arm& arm : arms) {
+                measure(src, arm, [&src, &scheduled, &arm, &requests, &mboardNames, kArm] {
+                    const auto end = Clock::now() + kArm;
+                    if (!arm.sweeps) {
+                        std::this_thread::sleep_until(end);
+                        return;
+                    }
+                    /*| frame: the request a receiver's poller sends, a Get of the sensors
+                            property naming the whole sweep or nothing, answered on the
+                            scheduler's message output. */
+                    if (arm.asked) {
+                        std::size_t asked = 0UZ;
+                        for (auto next = Clock::now(); next < end; next += std::chrono::milliseconds(arm.periodMs)) {
+                            std::this_thread::sleep_until(next);
+                            const bool whole = arm.kind == Sweep::Full || (arm.wholeEvery > 0 && asked % static_cast<std::size_t>(arm.wholeEvery) == 0UZ);
+                            ++asked;
+                            gr::Message request;
+                            request.cmd             = gr::message::Command::Get;
+                            request.serviceName     = std::string(src.unique_name);
+                            request.endpoint        = capture::property::kSensors;
+                            request.clientRequestID = std::format("sweep-{}", requests++);
+                            request.data            = whole ? gr::property_map{{"sweep", std::string("full")}} : gr::property_map{};
+                            const std::string   client = request.clientRequestID;
+                            const std::uint64_t s0     = steadyNs();
+                            scheduled.send(std::move(request));
+                            const auto reply = scheduled.await(
+                                [&client](const gr::Message& m) { return m.cmd == gr::message::Command::Final && m.endpoint == capture::property::kSensors && m.clientRequestID == client; },
+                                std::chrono::milliseconds(3000));
+                            const std::uint64_t s1 = steadyNs();
+                            if (!reply.has_value() || !reply->data.has_value()) {
+                                ++arm.unanswered;
+                            } else if (whole) {
+                                const auto readings = capture::sensorsFromReply(*reply->data);
+                                const auto carries  = [&readings](std::string_view id) { return std::ranges::any_of(readings, [id](const capture::SensorReading& r) { return r.id == id; }); };
+                                if (carries(capture::kSensorsWholePendingReading)) {
+                                    ++arm.pending;
+                                } else if (std::ranges::all_of(mboardNames, carries)) {
+                                    ++arm.wholeSets;
+                                }
+                            }
+                            arm.windows.emplace_back(s0, s1);
+                            arm.sweepMs.push_back(static_cast<double>(s1 - s0) / 1e6);
+                        }
+                        std::this_thread::sleep_until(end);
+                        return;
+                    }
+                    std::thread sweeper([&src, &arm, end] {
+                        std::vector<capture::SensorReading> out;
+                        for (auto next = Clock::now(); next < end; next += std::chrono::milliseconds(arm.periodMs)) {
+                            std::this_thread::sleep_until(next);
+                            const std::uint64_t s0 = steadyNs();
+                            std::ignore            = src.readSensors(out, arm.kind);
+                            const std::uint64_t s1 = steadyNs();
+                            arm.windows.emplace_back(s0, s1);
+                            arm.sweepMs.push_back(static_cast<double>(s1 - s0) / 1e6);
+                        }
+                    });
+                    std::this_thread::sleep_until(end);
+                    sweeper.join();
+                });
+                settle(500);
+            }
+
+            measure(src, stall, [] {
+                g_stallTaken.store(false);
+                g_stallMs.store(kStallMs);
+                settle(kStallMs + 2000);
+                g_stallMs.store(0);
+            });
+        });
+        expect(ran) << "the graph ran";
+
+        std::printf("sweep-beside-stream: %.0f S/s in force (%.0f asked for), a gap is a delivery interval over %.0f ms\n", rateInForce, kRate, static_cast<double>(kGapNs) / 1e6);
+        for (const auto& [id, ms] : perSensorMs) {
+            std::printf("sweep-beside-stream: read cost %-20s %9.3f ms\n", id.c_str(), ms);
+        }
+        const auto report = [](const Arm& arm) {
+            std::size_t inSweep = 0UZ;
+            for (const auto& gap : arm.gaps) {
+                if (std::ranges::any_of(arm.windows, [&gap](const auto& w) { return gap.first < w.second && gap.second > w.first; })) {
+                    ++inSweep;
+                }
+            }
+            double lo = 0.0;
+            double hi = 0.0;
+            double sum = 0.0;
+            if (!arm.sweepMs.empty()) {
+                lo  = *std::ranges::min_element(arm.sweepMs);
+                hi  = *std::ranges::max_element(arm.sweepMs);
+                for (const double ms : arm.sweepMs) {
+                    sum += ms;
+                }
+            }
+            std::printf("sweep-beside-stream: arm %-20s %.2f s, %llu samples (%.0f S/s), overflow events %llu, dropped samples %llu, sequence errors %llu, gap markers %llu; "
+                        "%zu sweeps of %.1f to %.1f ms (mean %.1f), %llu unanswered, %llu whole answers pending, %llu carrying the whole set; longest delivery gap %.1f ms, %zu gaps over the threshold, %zu of them overlapping a sweep\n",
+                        arm.name, arm.seconds, static_cast<unsigned long long>(arm.samples), arm.seconds > 0.0 ? static_cast<double>(arm.samples) / arm.seconds : 0.0,
+                        static_cast<unsigned long long>(arm.overflows), static_cast<unsigned long long>(arm.dropped), static_cast<unsigned long long>(arm.seqErrors),
+                        static_cast<unsigned long long>(arm.markers), arm.sweepMs.size(), lo, hi, arm.sweepMs.empty() ? 0.0 : sum / static_cast<double>(arm.sweepMs.size()), static_cast<unsigned long long>(arm.unanswered), static_cast<unsigned long long>(arm.pending), static_cast<unsigned long long>(arm.wholeSets), arm.longestGapMs,
+                        arm.gaps.size(), inSweep);
+            for (std::size_t i = 0UZ; i < arm.windows.size(); ++i) {
+                const std::uint64_t t0 = arm.windows.front().first;
+                std::printf("sweep-beside-stream:   sweep %2zu at %8.1f ms took %8.1f ms\n", i, static_cast<double>(arm.windows[i].first - t0) / 1e6, arm.sweepMs[i]);
+            }
+            const std::uint64_t base = arm.windows.empty() ? (arm.gaps.empty() ? 0UL : arm.gaps.front().first) : arm.windows.front().first;
+            for (const auto& [a, b] : arm.gaps) {
+                std::printf("sweep-beside-stream:   gap at %8.1f ms lasting %8.1f ms\n", (static_cast<double>(a) - static_cast<double>(base)) / 1e6, static_cast<double>(b - a) / 1e6);
+            }
+        };
+        for (const Arm& arm : arms) {
+            report(arm);
+        }
+        report(stall);
+
+        const Arm& quiet = arms[2];
+        expect(quiet.samples > 0UL) << "the arm without a sweep streamed";
+        expect(quiet.overflows == 0UL) << "and lost no overflow event";
+        expect(quiet.dropped == 0UL) << "no sample";
+        expect(quiet.seqErrors == 0UL) << "and no packet";
+        for (const Arm& arm : arms) {
+            if (!arm.asked) {
+                continue;
+            }
+            expect(arm.unanswered == 0UL) << "every sensors request is answered: " << arm.name;
+            expect(arm.overflows == 0UL && arm.dropped == 0UL && arm.seqErrors == 0UL) << "an arm that asks through the property loses nothing: " << arm.name;
+            expect(arm.longestGapMs < static_cast<double>(kGapNs) / 1e6) << "and leaves no delivery gap past the gap watch's threshold: " << arm.name << " " << arm.longestGapMs << " ms";
+        }
+        /*| frame: the first arm runs a receiver's poller from the start: its first whole request
+                finds no whole sweep landed. */
+        const Arm& polled = arms.front();
+        expect(polled.pending >= 1UL) << "the first whole request after the start states the whole set pending";
+        expect(polled.wholeSets > 0UL) << "and a whole request after the whole sweep lands receives the whole set";
     });
 
     cases("uhd.overflow-under-a-stalled-consumer", [] {

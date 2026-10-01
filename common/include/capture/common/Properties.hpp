@@ -444,10 +444,18 @@ SensorReading streamStateReading(const TBlock& blk) {
 
 namespace detail {
 
+/*| contract: a block that keeps its readings in a cache answers from cachedSensors, which reads
+        no device on the thread that serves the block's messages. Any other block sweeps its
+        device here.
+*/
 template <typename TBlock>
 std::optional<std::vector<SensorReading>> sweepSensors(TBlock& blk, bool full) {
     std::vector<SensorReading> out;
-    if constexpr (requires { typename TBlock::SensorSweep; }) {
+    if constexpr (requires { blk.cachedSensors(out, TBlock::SensorSweep::Full); }) {
+        if (!blk.cachedSensors(out, full ? TBlock::SensorSweep::Full : TBlock::SensorSweep::Brief)) {
+            return std::nullopt;
+        }
+    } else if constexpr (requires { typename TBlock::SensorSweep; }) {
         if (!blk.readSensors(out, full ? TBlock::SensorSweep::Full : TBlock::SensorSweep::Brief)) {
             return std::nullopt;
         }
