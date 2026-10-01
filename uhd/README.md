@@ -128,6 +128,35 @@ A rate change and a stop stop the stream and drain it. The drain ends on the
 stream's end-of-burst marker, on a receive that finds nothing, or after
 0.3 s, whichever comes first.
 
+## Bursts
+
+The sink reads three tags on its input:
+
+| Tag       | Type                   | Effect                               |
+|-----------|------------------------|--------------------------------------|
+| `tx_sob`  | any                    | none                                 |
+| `tx_eob`  | `bool`                 | the send ends at this sample         |
+| `tx_time` | integer, 0 to 2^63 - 1 | the send starts at this sample, time |
+
+A send ends at a sample tagged `tx_eob = true` and carries `end_of_burst`.
+The first send after an end carries `start_of_burst`. A send starts at a
+sample tagged `tx_time` and carries that time as its `time_spec`. The time
+counts nanoseconds on the device clock. The sink sets no device clock, so
+the epoch is the one the device holds. A source started on the same unit sets
+that clock to UTC: from the host clock, or on a pulse-per-second source from
+the GPS second where the oscillator has a fix. A send never runs past a
+burst's last sample or into a timed sample after its first.
+
+A `tx_eob = true` can also arrive with the end of the stream, at the
+end-of-stream index one past the last sample. It ends the burst at the last
+sample the sink staged. Where the device has already taken that sample, the
+sink sends one zero sample that carries `end_of_burst`. Under a stop request
+the end of the stream ends no burst, and the stop ends the burst itself.
+
+The sink ignores a `tx_eob` that is not a `bool` and a `tx_time` outside the
+table's range. It reports the first such tag of a run on its message port
+and ignores every other tag.
+
 ## What it needs
 
 - libuhd 4.0 or later, with its headers.

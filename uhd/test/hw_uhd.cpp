@@ -34,6 +34,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -516,6 +517,61 @@ gr::property_map sinkSettings(double rateHz, double freqHz, const std::string& a
         {"tx_antennae", std::vector<std::string>{antenna}},
     };
 }
+
+/*| role: the graph end of the tagged-burst case: the -20 dBFS tone of hw_tone in bursts of
+        burst_samples each, tx_sob on each burst's first sample and tx_eob on its last, and
+        nothing after the last burst.
+    frame: the second burst's first sample also carries tx_time: the device time deviceNowNs
+        answers when the sample is made, plus leadNs. The lead covers the transmit queue and
+        the graph's buffer, which hold under 0.3 s at 2 MS/s, so the time is still ahead when
+        the send reaches the device.
+*/
+struct [[maybe_unused]] hw_burst_tone : gr::Block<hw_burst_tone> {
+    gr::PortOut<CF32> out;
+    GR_MAKE_REFLECTABLE(hw_burst_tone, out);
+
+    std::size_t                                  burstSamples = 200000UZ;
+    std::size_t                                  bursts       = 3UZ;
+    std::int64_t                                 leadNs       = 500'000'000;
+    std::function<std::optional<std::int64_t>()> deviceNowNs;
+    std::optional<std::int64_t>                  timedAtNs; // the time the second burst carried
+    std::uint64_t                                _n = 0;
+
+    gr::work::Status processBulk(gr::OutputSpanLike auto& output) {
+        const std::uint64_t total = static_cast<std::uint64_t>(burstSamples) * bursts;
+        if (_n >= total) {
+            output.publish(0UZ);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            return gr::work::Status::OK;
+        }
+        const std::size_t count = static_cast<std::size_t>(std::min<std::uint64_t>(output.size(), total - _n));
+        for (std::size_t i = 0UZ; i < count; ++i) {
+            const std::uint64_t index = _n + i;
+            const double        phase = 2.0 * std::numbers::pi * 0.125 * static_cast<double>(index);
+            output[i]                 = CF32{static_cast<float>(0.1 * std::cos(phase)), static_cast<float>(0.1 * std::sin(phase))};
+            const std::uint64_t at    = index % burstSamples;
+            gr::property_map    tag;
+            if (at == 0U) {
+                tag["tx_sob"] = true;
+                if (index / burstSamples == 1U && deviceNowNs) {
+                    if (const auto now = deviceNowNs(); now.has_value()) {
+                        timedAtNs      = *now + leadNs;
+                        tag["tx_time"] = *timedAtNs;
+                    }
+                }
+            }
+            if (at + 1U == burstSamples) {
+                tag["tx_eob"] = true;
+            }
+            if (!tag.empty()) {
+                output.publishTag(tag, i);
+            }
+        }
+        output.publish(count);
+        _n += count;
+        return gr::work::Status::OK;
+    }
+};
 
 // Run body(sink) against a started transmit graph, then stop it and release the device.
 template <typename Body>
@@ -2163,6 +2219,62 @@ int main(int argc, char** argv) {
         expect(line.find(std::format("filter {:.3f} MHz", txBandwidth / 1e6)) != std::string::npos) << "and the filter the device holds";
         expect(heldFlag) << "a pause ends the burst and holds the carrier down";
         expect(!resumedFlag) << "and the resumed stream sends again";
+        expect(deviceOpens()) << "and the device is released when the graph stops";
+    });
+
+    cases("uhd.tx-tagged-bursts", [] {
+        /*| frame: three bursts of 0.1 s of a -20 dBFS tone into the terminated transmit port at
+                0 dB gain, each opened by tx_sob and ended by tx_eob, the second timed by tx_time
+                half a second ahead of the device clock. Nothing here raises the transmit gain.
+            frame: the case waits for the device's burst acknowledgments before it stops the
+                graph, since the stop finds no burst open and waits for none.
+        */
+        constexpr double kRate  = 2.0e6;
+        const double     kFreq  = bandFreq();
+        bool             upFlag = false;
+        std::uint64_t    acks = 0, ends = 0, gaps = 0, lost = 0, late = 0;
+        std::optional<std::int64_t> timedAt;
+        capture::uhd::Sink::BurstEnd stopSaid = capture::uhd::Sink::BurstEnd::Unconfirmed;
+
+        gr::Graph flow;
+        auto&     tone = flow.emplaceBlock<hw_burst_tone>({{"name", std::string("bursts")}});
+        auto&     sink = flow.emplaceBlock<capture::uhd::Sink>(sinkSettings(kRate, kFreq, {}));
+        tone.deviceNowNs = [&sink]() -> std::optional<std::int64_t> {
+            std::lock_guard lock(sink._ctrlMutex);
+            if (sink._usrp == nullptr) {
+                return std::nullopt;
+            }
+            return sink._usrp->get_time_now(0).to_ticks(1e9);
+        };
+        expect(fatal(flow.connect<"out", "in">(tone, sink).has_value())) << "the burst tone wires to the sink";
+        Scheduled scheduled;
+        expect(fatal(scheduled.adopt(std::move(flow)).has_value())) << "the transmit graph builds";
+        scheduled.start();
+        upFlag              = waitForDeviceUp(sink, std::chrono::seconds(10));
+        const auto deadline = Clock::now() + std::chrono::seconds(5);
+        while (sink.burstAcks() < 3U && Clock::now() < deadline) {
+            settle(10);
+        }
+        acks    = sink.burstAcks();
+        ends    = sink._endsPlaced.load();
+        gaps    = sink.underrunEvents();
+        lost    = sink.sequenceErrors();
+        late    = sink.latePackets();
+        timedAt = tone.timedAtNs;
+        scheduled.stop();
+        stopSaid = sink.stopBurstEnd();
+
+        std::printf("tx tagged bursts: %llu ends placed, %llu burst acknowledgments, %llu transmit gaps, %llu packets lost, %llu packets late\n", static_cast<unsigned long long>(ends),
+                    static_cast<unsigned long long>(acks), static_cast<unsigned long long>(gaps), static_cast<unsigned long long>(lost), static_cast<unsigned long long>(late));
+        std::printf("tx tagged bursts: the second burst carried the device time %lld ns; the stop found %s\n", static_cast<long long>(timedAt.value_or(-1)),
+                    stopSaid == capture::uhd::Sink::BurstEnd::NoneOpen ? "no burst open" : "a burst open");
+
+        expect(upFlag) << "the device opens for transmit";
+        expect(timedAt.has_value()) << "the second burst carried a time";
+        expect(ends == 3U) << "each tx_eob placed one end of burst";
+        expect(acks == 3U) << "and the device acknowledged each";
+        expect(late == 0U) << "the timed burst reached the device ahead of its time";
+        expect(stopSaid == capture::uhd::Sink::BurstEnd::NoneOpen) << "the last tx_eob left no burst for the stop to end";
         expect(deviceOpens()) << "and the device is released when the graph stops";
     });
 

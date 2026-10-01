@@ -26,7 +26,10 @@ The sink's drain is the block's own thread, blocking in `send()` at the sample r
 it places is a `tx_streamer` burst of CF32. The work call clips each sample into the queue in
 one pass, the only pass before the send, and a send reads the queue in place: the whole
 contiguous span it holds, never across its end and at most 10 ms of samples at the rate in
-force in whole frames, one frame at the least. UHD cuts the span into frames itself. The
+force in whole frames, one frame at the least. UHD cuts the span into frames itself. A send
+also ends at a sample tagged `tx_eob = true` and stops short of a sample tagged `tx_time`; the
+work call marks those samples by queue index before it publishes them, and the drain reads
+the marks for each send. The
 queue stays because `send()` blocks while the device's buffers are full, and the work call
 runs on the scheduler's thread with the other blocks of its job. The drain's one timed wait
 is the send's own timeout: on an empty queue or a park it waits on a doorbell the work call
@@ -240,6 +243,17 @@ reading then states the frame alone.
   and a zero-fill took 75 ms.
 - The drain places the queue itself, so a stop waits for the queue alone and a stop asked for
   while the carrier is held ends at once, the parked drain taking nothing out of the queue.
+- A send that ends at a sample tagged `tx_eob = true` carries `end_of_burst` and counts as an
+  end placed, so the stop's wait for its own acknowledgment counts it too. The next send
+  opens a burst. A send that starts at a sample tagged `tx_time` carries that count of
+  nanoseconds as its `time_spec` on the device clock, which the sink never sets; a later
+  piece of a send UHD returned short carries neither the start nor the time. A `tx_eob` at the
+  end-of-stream index, read from the input's tag ring in the epilogue, marks the last sample
+  queued, or has the drain place an end of burst of one zero sample where that sample has
+  gone. The epilogue reads the drain's tail under the mutex the drain moves it under, and a
+  mark that arrives after its send was formed has the drain place that end straight after the
+  send. A resize of the queue drops the marks with the samples, and a stop request makes the
+  epilogue end nothing.
 - A pause ends the burst, which keys the radio down, and keeps the queue. It throws nothing
   away and the count of what a pause discarded stays at zero; a stop after one counts what is
   left as unsent. The block goes on consuming under a pause: a work call stages into the

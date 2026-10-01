@@ -9,6 +9,7 @@
     why: every one of these is a pure function, a ring the case builds itself or an address the
         case spells, so the rule it pins is checked here rather than on the bench.
 */
+#include <capture/common/Properties.hpp>
 #include <capture/common/Sink.hpp>
 #include <capture/uhd/Sink.hpp>
 #include <capture/uhd/Source.hpp>
@@ -287,6 +288,242 @@ RunEnd runToEnd(gr::Graph flow) {
     end.errors   = scheduled->errors();
     delete scheduled;
     return end;
+}
+
+/*| role: a stand-in for a transmit streamer that keeps every send's metadata: where in the
+        stream it starts, how many samples it asks for, whether they come from the queue, and
+        the start, the end and the time it carries. No device is opened.
+    frame: a send that does not read the queue is an end of burst placed on its own, which
+        carries one zero sample.
+*/
+struct BurstStream : ::uhd::tx_streamer {
+    struct Send {
+        std::size_t  first     = 0UZ;
+        std::size_t  n         = 0UZ;
+        bool         fromQueue = false;
+        bool         starts    = false;
+        bool         ends      = false;
+        bool         timed     = false;
+        std::int64_t timeNs    = 0;
+    };
+    capture::uhd::Sink&      sink;
+    mutable std::mutex       mutex;
+    std::vector<Send>        log;
+    std::size_t              placed = 0UZ;
+    std::atomic<std::size_t> queued{0};
+    std::atomic<std::size_t> endsSent{0};
+
+    explicit BurstStream(capture::uhd::Sink& s) : sink(s) {}
+    std::size_t get_num_channels() const override { return 1UZ; }
+    std::size_t get_max_num_samps() const override { return 363UZ; }
+    std::size_t send(const buffs_type& buffs, const std::size_t nsamps, const ::uhd::tx_metadata_t& md, const double) override {
+        const auto*     p         = static_cast<const std::complex<float>*>(buffs[0]);
+        const auto*     begin     = sink._ring.buf.data();
+        const bool      fromQueue = p >= begin && p < begin + sink._ring.buf.size();
+        std::lock_guard lock(mutex);
+        log.push_back({placed, nsamps, fromQueue, md.start_of_burst, md.end_of_burst, md.has_time_spec, md.has_time_spec ? md.time_spec.to_ticks(1e9) : 0});
+        if (fromQueue) {
+            placed += nsamps;
+            queued.store(placed);
+        }
+        if (md.end_of_burst) {
+            endsSent.fetch_add(1UZ);
+        }
+        return nsamps;
+    }
+    bool recv_async_msg(::uhd::async_metadata_t&, double) override { return false; }
+    void post_output_action(const std::shared_ptr<::uhd::rfnoc::action_info>&, const std::size_t) override {}
+
+    std::vector<Send> sends() const {
+        std::lock_guard lock(mutex);
+        return log;
+    }
+};
+
+/*| role: a sink block driven without a device: a queue, the burst stand-in behind it and the
+        drain the case starts itself. The block is never started, so no device is opened.
+*/
+struct BurstRig {
+    capture::uhd::Sink           sink{};
+    std::shared_ptr<BurstStream> stream;
+
+    explicit BurstRig(std::size_t queueSamples = 65536UZ) {
+        capture::resizeRing(sink._ring, queueSamples);
+        sink._maxSendSamples = 363UZ;
+        sink._rateActualHz   = 1.0e6;
+        sink.publishSendCapLocked();
+        stream       = std::make_shared<BurstStream>(sink);
+        sink._stream = stream;
+        sink._deviceUp.store(true);
+    }
+    ~BurstRig() {
+        sink._drain.requestStop();
+        sink.wakeDrain();
+        sink._drain.joinIfRunning();
+        sink._deviceUp.store(false);
+        sink._stream.reset();
+    }
+    BurstRig(const BurstRig&)            = delete;
+    BurstRig& operator=(const BurstRig&) = delete;
+
+    void startDrain() {
+        sink._drain.start([this] { sink.drainLoop(); });
+    }
+
+    // Wait until the stand-in holds n queued samples and ends end-of-burst sends, or two seconds.
+    bool waitFor(std::size_t n, std::size_t ends) const {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (stream->queued.load() >= n && stream->endsSent.load() >= ends) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return false;
+    }
+};
+
+/*| role: a stream of n samples of 0.5 carrying the tags a case lists, at their stream indices.
+        It ends its stream once mayEnd holds, where a case gives one.
+*/
+struct BurstFeed : gr::Block<BurstFeed> {
+    gr::PortOut<std::complex<float>> out;
+    GR_MAKE_REFLECTABLE(BurstFeed, out);
+
+    std::size_t                                          n = 0UZ;
+    std::vector<std::pair<std::size_t, gr::property_map>> tags;
+    std::function<bool()>                                mayEnd;
+    std::size_t                                          _sent = 0UZ;
+
+    gr::work::Status processBulk(gr::OutputSpanLike auto& output) {
+        const std::size_t count = std::min(output.size(), n - _sent);
+        std::fill_n(output.begin(), count, std::complex<float>{0.5f, 0.0f});
+        for (const auto& [index, map] : tags) {
+            if (index >= _sent && index < _sent + count) {
+                output.publishTag(map, index - _sent);
+            }
+        }
+        output.publish(count);
+        _sent += count;
+        if (_sent < n || (mayEnd && !mayEnd())) {
+            return gr::work::Status::OK;
+        }
+        return gr::work::Status::DONE;
+    }
+};
+
+/*| role: passes its input through, and when the input ends publishes tx_eob = true at the
+        end-of-stream index, one past the last sample.
+*/
+struct EndBurstAtStreamEnd : gr::Block<EndBurstAtStreamEnd> {
+    gr::PortIn<std::complex<float>>  in;
+    gr::PortOut<std::complex<float>> out;
+    GR_MAKE_REFLECTABLE(EndBurstAtStreamEnd, in, out);
+
+    gr::work::Status processBulk(gr::InputSpanLike auto& input, gr::OutputSpanLike auto& output) {
+        std::ranges::copy(input, output.begin());
+        return gr::work::Status::OK;
+    }
+
+    gr::work::Status processEpilogue(gr::InputSpanLike auto& /*input*/, gr::OutputSpanLike auto& output) {
+        if (!gr::lifecycle::isShuttingDown(this->state())) {
+            output.publishTag(gr::property_map{{"tx_eob", true}}, 0UZ);
+        }
+        output.publish(0UZ);
+        return gr::work::Status::OK;
+    }
+};
+
+/*| role: the graph end of a burst case: it hands each span it is given to a sink block outside
+        the graph, and at the end of the stream the tags its own input holds past the last
+        sample.
+    why: the sink's start opens a device, so the sink itself cannot run under a scheduler here.
+        The spans and the tag ring the scheduler gives this block are the ones it would give
+        the sink.
+*/
+struct BurstProbe : gr::Block<BurstProbe> {
+    gr::PortIn<std::complex<float>> in;
+    GR_MAKE_REFLECTABLE(BurstProbe, in);
+
+    capture::uhd::Sink* target = nullptr;
+
+    gr::work::Status processBulk(gr::InputSpanLike auto& input) noexcept { return target->processBulk(input); }
+
+    gr::work::Status processEpilogue(gr::InputSpanLike auto& input) noexcept {
+        std::ignore = target->endBurstAtStreamEnd(in, input.streamIndex);
+        return gr::work::Status::OK;
+    }
+};
+
+using BurstTags = std::vector<std::pair<std::size_t, gr::property_map>>;
+
+gr::property_map burstStart() { return {{"tx_sob", true}}; }
+gr::property_map burstEnd() { return {{"tx_eob", true}}; }
+
+/*| contract: run n samples carrying tags through a feed, a relay where relayed is set, and the
+        probe into rig's sink, and answer whether the run ended by itself. The feed ends its
+        stream once mayEnd holds, where one is given.
+*/
+bool runBursts(BurstRig& rig, std::size_t n, BurstTags tags, bool relayed = false, std::function<bool()> mayEnd = {}) {
+    gr::Graph flow;
+    auto&     feed = flow.emplaceBlock<BurstFeed>();
+    feed.n         = n;
+    feed.tags      = std::move(tags);
+    feed.mayEnd    = std::move(mayEnd);
+    auto& probe    = flow.emplaceBlock<BurstProbe>();
+    probe.target   = &rig.sink;
+    if (relayed) {
+        auto& relay = flow.emplaceBlock<EndBurstAtStreamEnd>();
+        if (!flow.connect<"out", "in">(feed, relay).has_value() || !flow.connect<"out", "in">(relay, probe).has_value()) {
+            return false;
+        }
+    } else if (!flow.connect<"out", "in">(feed, probe).has_value()) {
+        return false;
+    }
+    const RunEnd end = runToEnd(std::move(flow));
+    return end.returned && !end.failed;
+}
+
+struct TimedSample {
+    std::size_t  index  = 0UZ;
+    std::int64_t timeNs = 0;
+};
+
+/*| contract: the sends a case recorded against the bursts it tagged. Every queued sample goes
+        out once and in order. A send from the queue carries the end of burst exactly when it
+        ends at a burst's last sample, and a time exactly when it starts at a timed sample,
+        with that sample's time. No send runs past a burst's last sample or into a timed sample
+        after its own first. A send carries the start of burst exactly when it is the first or
+        follows a send that ended a burst.
+*/
+void expectBurstSends(std::string_view scenario, const std::vector<BurstStream::Send>& sends, std::size_t n, const std::vector<std::size_t>& lastSamples, const std::vector<TimedSample>& timed) {
+    using namespace boost::ut;
+    std::size_t queued     = 0UZ;
+    bool        burstEnded = true;
+    for (const BurstStream::Send& send : sends) {
+        expect(send.starts == burstEnded) << std::format("{}: the send at {} carries start_of_burst exactly when it opens a burst", scenario, send.first);
+        burstEnded = send.ends;
+        if (!send.fromQueue) {
+            continue;
+        }
+        expect(send.first == queued) << std::format("{}: the send at {} follows the one before it", scenario, send.first);
+        queued += send.n;
+        const std::size_t last       = send.first + send.n - 1UZ;
+        const auto        timedStart = std::ranges::find(timed, send.first, &TimedSample::index);
+        expect(send.ends == std::ranges::contains(lastSamples, last)) << std::format("{}: the send over [{}, {}] carries end_of_burst exactly when {} is a burst's last sample", scenario, send.first, last, last);
+        expect(send.timed == (timedStart != timed.end())) << std::format("{}: the send at {} carries a time exactly when it starts at a timed sample", scenario, send.first);
+        expect(send.timeNs == (timedStart != timed.end() ? timedStart->timeNs : 0)) << std::format("{}: the send at {} carries its first sample's time and no other", scenario, send.first);
+        for (const std::size_t end : lastSamples) {
+            expect(!(send.first <= end && end < last)) << std::format("{}: the send over [{}, {}] runs past the burst's last sample {}", scenario, send.first, last, end);
+        }
+        for (const TimedSample& t : timed) {
+            expect(!(send.first < t.index && t.index <= last)) << std::format("{}: the send over [{}, {}] runs into the timed sample {}", scenario, send.first, last, t.index);
+        }
+    }
+    expect(queued == n) << std::format("{}: every queued sample goes out once", scenario);
+    for (const std::size_t end : lastSamples) {
+        expect(std::ranges::any_of(sends, [end](const BurstStream::Send& s) { return s.fromQueue && s.ends && s.first + s.n == end + 1UZ; })) << std::format("{}: the burst's last sample {} goes out on a send that ends the burst", scenario, end);
+    }
 }
 
 } // namespace
@@ -2277,6 +2514,109 @@ int main(int argc, char** argv) {
     cases("sink.uhd-both-blocks-declare-their-labels", [] {
         capture::test::expectLabels<capture::uhd::Source>({"family/uhd", "role/source", "holds/device", "ingests/rf", "ingests/time"});
         capture::test::expectLabels<capture::uhd::Sink>({"family/uhd", "role/sink", "holds/device", "emits/rf", "ingests/time"});
+    });
+
+    cases("sink.uhd-a-burst-ends-at-its-tagged-sample", [] {
+        /*| frame: 3000 samples through the probe into a queue of 65536 with the drain running,
+                a burst opened at the first sample and ended at sample 1233. The samples after
+                it open the next burst, which the stream leaves open.
+        */
+        constexpr std::size_t kSamples = 3000UZ;
+        constexpr std::size_t kLast    = 1233UZ;
+        BurstRig              rig;
+        rig.startDrain();
+        expect(runBursts(rig, kSamples, {{0UZ, burstStart()}, {kLast, burstEnd()}})) << "the stream ends and the run returns";
+        expect(rig.waitFor(kSamples, 1UZ)) << "the drain sends every sample";
+        const auto sends = rig.stream->sends();
+        expectBurstSends("one burst", sends, kSamples, {kLast}, {});
+        expect(std::ranges::count_if(sends, &BurstStream::Send::ends) == 1) << "one send ends a burst";
+        expect(rig.sink._endsPlaced.load() == 1UZ) << "and the stop's wait counts it as an end placed";
+        expect(rig.sink._bursting.load()) << "the samples after the end opened a burst the stream left open";
+    });
+
+    cases("sink.uhd-two-bursts-in-one-buffer-end-at-their-own-samples", [] {
+        constexpr std::size_t kSamples = 600UZ;
+        BurstRig              rig;
+        rig.startDrain();
+        expect(runBursts(rig, kSamples, {{0UZ, burstStart()}, {199UZ, burstEnd()}, {200UZ, burstStart()}, {599UZ, burstEnd()}})) << "the stream ends and the run returns";
+        expect(rig.waitFor(kSamples, 2UZ)) << "the drain sends every sample and both ends";
+        const auto sends = rig.stream->sends();
+        expectBurstSends("two bursts", sends, kSamples, {199UZ, 599UZ}, {});
+        expect(fatal(!sends.empty()));
+        expect(sends.back().ends && sends.back().first + sends.back().n == kSamples) << "the stream's last send ends the second burst";
+        expect(!rig.sink._bursting.load()) << "and leaves no burst open";
+    });
+
+    cases("sink.uhd-a-timed-burst-starts-at-its-time", [] {
+        /*| frame: the first burst's time arrives as an unsigned 64-bit count and the second's as
+                a signed one; both are nanoseconds on the device clock.
+        */
+        constexpr std::size_t  kSamples = 1500UZ;
+        constexpr std::int64_t kFirstNs = 1'720'000'000'123'456'789LL;
+        constexpr std::int64_t kNextNs  = 1'720'000'001'000'000'250LL;
+        BurstRig               rig;
+        rig.startDrain();
+        const BurstTags tags{{300UZ, {{"tx_sob", true}, {"tx_time", static_cast<std::uint64_t>(kFirstNs)}}}, {899UZ, burstEnd()}, {900UZ, {{"tx_time", kNextNs}}}, {1499UZ, burstEnd()}};
+        expect(runBursts(rig, kSamples, tags)) << "the stream ends and the run returns";
+        expect(rig.waitFor(kSamples, 2UZ)) << "the drain sends every sample and both ends";
+        expectBurstSends("timed bursts", rig.stream->sends(), kSamples, {899UZ, 1499UZ}, {{300UZ, kFirstNs}, {900UZ, kNextNs}});
+    });
+
+    cases("sink.uhd-a-mistyped-burst-tag-is-reported-once", [] {
+        constexpr std::size_t kSamples = 1000UZ;
+        BurstRig              rig;
+        gr::MsgPortIn         reports;
+        expect(fatal(rig.sink.msgOut.connect(reports).has_value())) << "the case reads the sink's message port";
+        rig.startDrain();
+        const BurstTags tags{{100UZ, {{"tx_eob", std::int32_t{1}}}}, {300UZ, {{"tx_time", 1.5}}}, {500UZ, {{"tx_time", std::int64_t{-1}}}}};
+        expect(runBursts(rig, kSamples, tags)) << "the stream ends and the run returns";
+        expect(rig.waitFor(kSamples, 0UZ)) << "the drain sends every sample";
+        expectBurstSends("mistyped tags", rig.stream->sends(), kSamples, {}, {});
+
+        auto                     messages = reports.streamReader().get();
+        std::vector<std::string> errors;
+        for (const gr::Message& m : messages) {
+            if (m.data.has_value()) {
+                if (const std::string text = capture::detail::textField(*m.data, "error"); !text.empty()) {
+                    errors.push_back(text);
+                }
+            }
+        }
+        std::ignore = messages.consume(messages.size());
+        expect(fatal(errors.size() == 1UZ)) << "one report for the run";
+        expect(errors.front().contains("tx_eob") && errors.front().contains("100")) << "naming the first mistyped tag and its sample: " << errors.front();
+    });
+
+    cases("sink.uhd-a-stream-end-tag-ends-the-burst-at-the-last-sample", [] {
+        /*| frame: the relay publishes tx_eob at the end-of-stream index once its input ends. The
+                drain starts after the run, so the epilogue finds the stream's last sample still
+                queued.
+        */
+        constexpr std::size_t kSamples = 3000UZ;
+        BurstRig              rig(4096UZ);
+        expect(runBursts(rig, kSamples, {}, true)) << "the stream ends and the run returns";
+        rig.startDrain();
+        expect(rig.waitFor(kSamples, 1UZ)) << "the drain sends every sample and an end";
+        const auto sends = rig.stream->sends();
+        expectBurstSends("tx_eob at the end of the stream", sends, kSamples, {kSamples - 1UZ}, {});
+        expect(std::ranges::all_of(sends, &BurstStream::Send::fromQueue)) << "no end of burst goes out on its own";
+    });
+
+    cases("sink.uhd-a-stream-end-tag-after-the-last-send-ends-the-burst-alone", [] {
+        /*| frame: the feed ends its stream only once the stand-in holds every sample, so the
+                epilogue finds the stream's last sample already sent.
+        */
+        constexpr std::size_t kSamples = 3000UZ;
+        BurstRig              rig;
+        rig.startDrain();
+        auto* stream = rig.stream.get();
+        expect(runBursts(rig, kSamples, {}, true, [stream] { return stream->queued.load() >= kSamples; })) << "the stream ends and the run returns";
+        expect(rig.waitFor(kSamples, 1UZ)) << "the drain sends every sample and an end";
+        const auto sends = rig.stream->sends();
+        expect(fatal(!sends.empty()));
+        expect(!sends.back().fromQueue && sends.back().ends && sends.back().first == kSamples) << "the last send follows the last sample, holds no queued sample and ends the burst";
+        expect(std::none_of(sends.begin(), std::prev(sends.end()), [](const BurstStream::Send& s) { return s.ends; })) << "no send of queued samples ends a burst";
+        expect(!rig.sink._bursting.load()) << "and no burst is left open";
     });
 
     return cases.report();

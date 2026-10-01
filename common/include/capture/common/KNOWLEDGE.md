@@ -365,7 +365,8 @@ hooks — `start`, `stop`, `pause`, `resume` — open the device, release it, ta
 down and bring it back.
 
 **io**
-CF32 in, full scale 1.0 in each part; tags on the input are ignored. Settings in — the
+CF32 in, full scale 1.0 in each part. A sink reads the burst tags `tx_sob`, `tx_eob` and
+`tx_time` where its family's knowledge says so, and ignores every other tag. Settings in — the
 source's names, with the `tx_` prefix for what a transmitter has and none for what it has
 not, so one caller drives both directions identically. `enumerateDevices()` offers the pairs
 the source offers, from one body both families call. `describeControls()` states the transmit

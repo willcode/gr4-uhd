@@ -13,12 +13,14 @@
 #include <capture/common/Device.hpp>
 #include <capture/common/Sink.hpp>
 #include <capture/common/ControlDesc.hpp>
+#include <capture/common/Properties.hpp>
 #include <capture/uhd/Device.hpp>
 
 #include <uhd/device.hpp>
 #include <uhd/exception.hpp>
 #include <uhd/stream.hpp>
 #include <uhd/types/device_addr.hpp>
+#include <uhd/types/time_spec.hpp>
 #include <uhd/types/tune_request.hpp>
 #include <uhd/usrp/multi_usrp.hpp>
 
@@ -30,6 +32,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <format>
 #include <limits>
 #include <mutex>
@@ -74,14 +77,26 @@ namespace capture::uhd {
 struct Sink : gr::Block<Sink> {
     using Description = gr::Doc<R"(USRP sink via libuhd.
 fc32 host samples over the sc16 or sc8 wire format, clipped to full scale 1.0 before they
-reach the wire. Tags on the input are ignored. The setting names are the USRP source's, with
-the tx_ prefix where a transmitter carries the thing, so one caller drives both directions
-identically. The device list asks libuhd with use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in
-the environment.)">;
+reach the wire. The setting names are the USRP source's, with the tx_ prefix where a
+transmitter carries the thing, so one caller drives both directions identically. The device
+list asks libuhd with use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in the environment.
+
+Three tags on the input mark transmit bursts. A send ends at a sample tagged tx_eob = true
+and carries end_of_burst. The first send after an end carries start_of_burst, and tx_sob asks
+for nothing more. A send starts at a sample tagged tx_time and carries that time as its
+time_spec: a count of nanoseconds on the device clock, any integer type. The block sets no
+device clock. A tx_eob = true can also arrive with the end of the stream, one past its last
+sample. It ends the burst at the last sample the block staged. When the device has already
+taken that sample, a send of one zero sample carries end_of_burst. Under a stop request the
+end of the stream ends no burst, and the stop ends the burst itself. The block ignores a
+tx_eob that is not a bool and a tx_time that is not an integer from 0 to 2^63 - 1. It
+reports the first such tag of a run on its message port. Other tags are ignored.)">;
 
     gr::PortIn<std::complex<float>> in;
 
     static constexpr const char* kDevice = "uhd"; // the family name a device listing and a probe carry
+    static constexpr std::string_view kTxEob  = "tx_eob";  // the burst ends at this sample
+    static constexpr std::string_view kTxTime = "tx_time"; // the send starts at this sample, at this time
     static constexpr bool        kListingOpens = false; // the listing asks libuhd, which opens no unit
     static constexpr double      kDefaultRateHz      = 2'000'000.0;
     static constexpr double      kDefaultFrequencyHz = 100'000'000.0;
@@ -221,6 +236,30 @@ the environment.)">;
             drain and the work call retry the resize from.
     */
     std::atomic<std::size_t>         _ringWantSamples{1UZ << 19};
+    /*| role: a queued sample that carries a burst tag, by its ring index, and what one send
+            takes from the queue and carries.
+        frame: a ring index counts from the last time the queue was sized, as the ring's own
+            head and tail do, so every resize of the queue drops the marks with the samples.
+    */
+    struct BurstMark {
+        std::size_t                 position  = 0UZ;
+        bool                        endsBurst = false;
+        std::optional<std::int64_t> timeNs;
+    };
+    struct BurstSend {
+        std::size_t                 n         = 0UZ;
+        bool                        endsBurst = false;
+        std::optional<std::int64_t> timeNs;
+    };
+    /*| invariant: the work call adds marks in ring order before it publishes their samples, and
+            the drain takes them off once their send has returned. The drain moves the ring's
+            tail under _burstMutex, so the epilogue reads a tail and places its mark or its owed
+            end against the same state the drain retires from.
+    */
+    std::mutex            _burstMutex;
+    std::deque<BurstMark> _burstMarks;
+    std::atomic<bool>     _endOwed{false};          // the device took the stream's last sample without an end of burst
+    bool                  _burstTagReported = false; // a mistyped burst tag was reported this run; the work call's alone
     ConsumerThread                   _drain;          // the ring into the streamer
     ConsumerThread                   _async;          // the device's asynchronous channel
     ControlProperties     _controlProperties{this};
@@ -742,6 +781,8 @@ the environment.)">;
         _counters.reset();
         _drainDead.store(false, std::memory_order_release);
         _bursting.store(false, std::memory_order_release);
+        dropBurstMarks();
+        _burstTagReported = false;
         _held.store(false, std::memory_order_release);
         _rateBreak.store(false, std::memory_order_release);
         _drainParked.store(false, std::memory_order_release);
@@ -1058,9 +1099,158 @@ the environment.)">;
         if (want == 0UZ) {
             return gr::work::Status::INSUFFICIENT_INPUT_ITEMS;
         }
-        const std::size_t take = stage(input.data(), want);
+        const std::size_t room = std::min(want, ringRoom(_ring));
+        markBurstTags(input, room);
+        const std::size_t take = stage(input.data(), room);
         std::ignore            = input.consume(take);
         return take == 0UZ ? gr::work::Status::INSUFFICIENT_OUTPUT_ITEMS : gr::work::Status::OK;
+    }
+
+    /*| contract: a tx_eob = true at or past the first sample the block did not consume ends the
+            burst at the last sample staged, as endBurstAtStreamEnd states. Only the input's tag
+            ring holds such a tag: it sits at the end-of-stream index, one past the last sample,
+            and no input span reaches it.
+    */
+    gr::work::Status processEpilogue(gr::InputSpanLike auto& input) noexcept {
+        std::ignore = endBurstAtStreamEnd(in, input.streamIndex);
+        return gr::work::Status::OK;
+    }
+
+    /*| contract: read the tag ring of port from the stream index from on, and where a tag there
+            holds tx_eob = true, end the burst at the last sample staged: a mark on that sample
+            where the drain has yet to send it, and an owed end of burst the drain places alone
+            where it has. Nothing under a stop request, with no device up or with the port not
+            connected. Answers whether it ended the burst. The tags stay in the ring.
+        why: a stop ends the burst itself through the teardown, whatever the tags say.
+        verified-by: sink.uhd-a-stream-end-tag-ends-the-burst-at-the-last-sample
+        verified-by: sink.uhd-a-stream-end-tag-after-the-last-send-ends-the-burst-alone
+    */
+    template <typename Port>
+    bool endBurstAtStreamEnd(Port& port, std::size_t from) {
+        if (gr::lifecycle::isShuttingDown(this->state()) || !_deviceUp.load(std::memory_order_acquire) || !port.isConnected()) {
+            return false;
+        }
+        bool endsBurst = false;
+        auto tags      = port.tagReader().get();
+        for (const gr::Tag& tag : tags) {
+            if (tag.index >= from) {
+                endsBurst = tagEndsBurst(tag.map, tag.index) || endsBurst;
+            }
+        }
+        std::ignore = tags.consume(0UZ);
+        if (endsBurst) {
+            endBurstAtLastStagedSample();
+        }
+        return endsBurst;
+    }
+
+    /*| contract: end the burst at the last sample staged since the queue was sized. The caller
+            is the queue's one producer.
+    */
+    void endBurstAtLastStagedSample() {
+        const std::size_t head = _ring.head.load(std::memory_order_relaxed);
+        if (head == 0UZ) {
+            return;
+        }
+        {
+            std::lock_guard lock(_burstMutex);
+            if (_ring.tail.load(std::memory_order_acquire) < head) {
+                holdBurstMark(BurstMark{.position = head - 1UZ, .endsBurst = true, .timeNs = std::nullopt});
+            } else {
+                _endOwed.store(true, std::memory_order_release);
+            }
+        }
+        wakeDrain();
+    }
+
+    /*| contract: mark the burst tags on the first nStaged samples of input, which the caller
+            stages behind this call at the ring's head. A tag the span hands back at a negative
+            index was read by an earlier call and is skipped.
+        verified-by: sink.uhd-a-burst-ends-at-its-tagged-sample
+    */
+    void markBurstTags(gr::InputSpanLike auto& input, std::size_t nStaged) {
+        const std::size_t head = _ring.head.load(std::memory_order_relaxed);
+        for (const auto& [relIndex, tagMap] : input.tags(nStaged)) {
+            if (relIndex >= 0) {
+                const auto offset = static_cast<std::size_t>(relIndex);
+                addBurstMark(head + offset, input.streamIndex + offset, tagMap.get());
+            }
+        }
+    }
+
+    // True where the tag holds tx_eob = true. A tx_eob that is not a bool is reported and ignored.
+    bool tagEndsBurst(const gr::property_map& tagMap, std::size_t streamIndex) {
+        const gr::pmt::Value* value = detail::field(tagMap, kTxEob);
+        if (value == nullptr) {
+            return false;
+        }
+        if (const bool* endsBurst = value->get_if<bool>(); endsBurst != nullptr) {
+            return *endsBurst;
+        }
+        reportIgnoredBurstTag(kTxEob, streamIndex, "a bool");
+        return false;
+    }
+
+    void addBurstMark(std::size_t position, std::size_t streamIndex, const gr::property_map& tagMap) {
+        BurstMark mark{.position = position, .endsBurst = tagEndsBurst(tagMap, streamIndex), .timeNs = std::nullopt};
+        if (const gr::pmt::Value* value = detail::field(tagMap, kTxTime); value != nullptr) {
+            mark.timeNs = deviceTimeNs<std::int64_t, std::uint64_t, std::int32_t, std::uint32_t, std::int16_t, std::uint16_t, std::int8_t, std::uint8_t>(*value);
+            if (!mark.timeNs.has_value()) {
+                reportIgnoredBurstTag(kTxTime, streamIndex, "an integer from 0 to 2^63 - 1");
+            }
+        }
+        if (!mark.endsBurst && !mark.timeNs.has_value()) {
+            return;
+        }
+        std::lock_guard lock(_burstMutex);
+        holdBurstMark(mark);
+    }
+
+    // Add a mark at the back, or merge it into the mark its sample already holds. Marks arrive
+    // in ring order. The caller holds _burstMutex.
+    void holdBurstMark(const BurstMark& mark) {
+        if (_burstMarks.empty() || _burstMarks.back().position != mark.position) {
+            _burstMarks.push_back(mark);
+            return;
+        }
+        BurstMark& held = _burstMarks.back();
+        held.endsBurst  = held.endsBurst || mark.endsBurst;
+        if (mark.timeNs.has_value()) {
+            held.timeNs = mark.timeNs;
+        }
+    }
+
+    // Drop every mark and the owed end, where the queue they index has been emptied.
+    void dropBurstMarks() {
+        std::lock_guard lock(_burstMutex);
+        _burstMarks.clear();
+        _endOwed.store(false, std::memory_order_release);
+    }
+
+    /*| contract: the value as nanoseconds where it holds one of the integer types Ints and lies
+            from 0 to the largest std::int64_t, and nothing otherwise.
+        frame: UHD counts a time_spec in whole seconds and a fraction, and from_ticks at 1e9 a
+            second takes the nanoseconds whole up to that bound.
+    */
+    template <typename... Ints>
+    static std::optional<std::int64_t> deviceTimeNs(const gr::pmt::Value& value) {
+        std::optional<std::int64_t> ns;
+        (
+            [&value, &ns] {
+                if (const Ints* held = value.get_if<Ints>(); held != nullptr && std::cmp_greater_equal(*held, 0) && std::cmp_less_equal(*held, std::numeric_limits<std::int64_t>::max())) {
+                    ns = static_cast<std::int64_t>(*held);
+                }
+            }(),
+            ...);
+        return ns;
+    }
+
+    void reportIgnoredBurstTag(std::string_view key, std::size_t streamIndex, std::string_view expected) {
+        if (_burstTagReported) {
+            return;
+        }
+        _burstTagReported = true;
+        this->emitMessage("processBulk()", {{"error", std::format("{} at sample {} is not {} and is ignored", key, streamIndex, expected)}});
     }
 
     /*| contract: clip and copy what the queue has room for out of the n samples at samples, ring
@@ -1360,6 +1550,7 @@ the environment.)">;
         }
         _counters.discardedAtRateChange.fetch_add(static_cast<std::uint64_t>(resizeRingCountingDiscard(_ring, ringWantSamplesLocked(), _queueSpare)), std::memory_order_relaxed);
         _ringCapacity.store(_ring.buf.size(), std::memory_order_release);
+        dropBurstMarks();
     }
 
     // The queue capacity the rate in force asks for, in samples. The caller holds _ctrlMutex.
@@ -1946,6 +2137,7 @@ the environment.)">;
             if (_held.load(std::memory_order_acquire) || _rateBreak.load(std::memory_order_acquire)) {
                 if (endBurstOnThisPass(_drainParked.load(std::memory_order_acquire))) {
                     std::ignore = endBurstWith(stream);
+                    _endOwed.store(false, std::memory_order_release);
                     _drainParked.store(true, std::memory_order_release);
                 }
                 awaitBell([this] {
@@ -1956,24 +2148,82 @@ the environment.)">;
             if (_drainParked.load(std::memory_order_acquire)) {
                 _drainParked.store(false, std::memory_order_release);
             }
+            if (_endOwed.exchange(false, std::memory_order_acq_rel)) {
+                std::ignore = endBurstWith(stream);
+                continue;
+            }
             std::size_t       tail = 0;
             const std::size_t have = _ring.available(tail);
             if (have == 0UZ) {
                 awaitBell([this] {
                     std::size_t at = 0;
-                    return !_drain.stopRequested() && !_held.load(std::memory_order_acquire) && !_rateBreak.load(std::memory_order_acquire) && _ring.available(at) == 0UZ && !queueOutsizesRate();
+                    return !_drain.stopRequested() && !_held.load(std::memory_order_acquire) && !_rateBreak.load(std::memory_order_acquire) && !_endOwed.load(std::memory_order_acquire) && _ring.available(at) == 0UZ && !queueOutsizesRate();
                 });
                 continue;
             }
-            const std::size_t pos  = tail & _ring.mask();
-            const std::size_t take = std::min({have, _sendCapSamples.load(std::memory_order_acquire), _ring.buf.size() - pos});
-            const bool        sent = sendChunk(stream, _ring.buf.data() + pos, take);
-            _ring.advanceTo(tail + take);
+            const std::size_t pos   = tail & _ring.mask();
+            const BurstSend   burst = nextBurstSend(tail, std::min({have, _sendCapSamples.load(std::memory_order_acquire), _ring.buf.size() - pos}));
+            const bool        sent  = sendChunk(stream, _ring.buf.data() + pos, burst.n, burst.endsBurst, burst.timeNs);
+            const bool        owed  = retireBurstMarks(tail, burst);
             if (!sent) {
                 _drainDead.store(true, std::memory_order_release);
                 return;
             }
+            if (owed) {
+                std::ignore = endBurstWith(stream);
+            }
         }
+    }
+
+    /*| contract: the send that starts at the ring index tail and takes at most n samples. It
+            ends at a burst's last sample and carries end_of_burst there. It stops short of a
+            timed sample, and a send that starts at one carries that sample's time.
+        verified-by: sink.uhd-two-bursts-in-one-buffer-end-at-their-own-samples
+        verified-by: sink.uhd-a-timed-burst-starts-at-its-time
+    */
+    BurstSend nextBurstSend(std::size_t tail, std::size_t n) {
+        BurstSend       send{.n = n, .endsBurst = false, .timeNs = std::nullopt};
+        std::lock_guard lock(_burstMutex);
+        for (const BurstMark& mark : _burstMarks) {
+            if (mark.position < tail) {
+                continue;
+            }
+            const std::size_t offset = mark.position - tail;
+            if (offset >= send.n) {
+                break;
+            }
+            if (mark.timeNs.has_value()) {
+                if (offset > 0UZ) {
+                    send.n = offset;
+                    break;
+                }
+                send.timeNs = mark.timeNs;
+            }
+            if (mark.endsBurst) {
+                send.n         = offset + 1UZ;
+                send.endsBurst = true;
+                break;
+            }
+        }
+        return send;
+    }
+
+    /*| contract: take the marks of the samples burst sent off the queue, move the ring's tail
+            past them, and answer whether a mark among them ended a burst the send did not end.
+        why: the epilogue can mark the stream's last sample after the send that takes it was
+            formed. The end of burst it asked for then goes out on its own, straight after.
+    */
+    bool retireBurstMarks(std::size_t tail, const BurstSend& burst) {
+        const std::size_t end  = tail + burst.n;
+        bool              owed = false;
+        std::lock_guard   lock(_burstMutex);
+        while (!_burstMarks.empty() && _burstMarks.front().position < end) {
+            const BurstMark& mark = _burstMarks.front();
+            owed                  = owed || (mark.endsBurst && !(burst.endsBurst && mark.position + 1UZ == end));
+            _burstMarks.pop_front();
+        }
+        _ring.advanceTo(end);
+        return owed;
     }
 
     // Wait on the drain's bell where idle() still holds once the bell is armed.
@@ -1988,16 +2238,24 @@ the environment.)">;
     }
 
     /*| contract: place the n samples at samples on the streamer, opening a burst where none is
-            open. False where the device stopped taking them, which is a send that timed out or
-            threw. The burst flag is read once and written once, where the call opens a burst.
+            open. endsBurst ends the burst at the last of them, counted as an end placed. timeNs
+            times the first of them on the device clock. False where the device stopped taking
+            them, which is a send that timed out or threw. The burst flag is written where the
+            call opens a burst and where it ends one.
+        frame: a send UHD returns short is finished by further sends of the rest, which carry
+            neither the start nor the time and carry the end of burst where the first asked
+            for it.
     */
-    bool sendChunk(const ::uhd::tx_streamer::sptr& stream, const std::complex<float>* samples, std::size_t n) {
+    bool sendChunk(const ::uhd::tx_streamer::sptr& stream, const std::complex<float>* samples, std::size_t n, bool endsBurst = false, std::optional<std::int64_t> timeNs = std::nullopt) {
         std::lock_guard    send(_sendMutex);
         ::uhd::tx_metadata_t md;
         md.start_of_burst = !_bursting.load(std::memory_order_acquire);
-        md.end_of_burst   = false;
-        md.has_time_spec  = false;
-        std::size_t done  = 0UZ;
+        md.end_of_burst   = endsBurst;
+        md.has_time_spec  = timeNs.has_value();
+        if (timeNs.has_value()) {
+            md.time_spec = ::uhd::time_spec_t::from_ticks(*timeNs, 1e9);
+        }
+        std::size_t done = 0UZ;
         try {
             while (done < n) {
                 const std::size_t sent = stream->send(samples + done, n - done, md, kSendTimeoutS);
@@ -2006,6 +2264,7 @@ the environment.)">;
                     return false;
                 }
                 done += sent;
+                md.has_time_spec = false;
                 if (md.start_of_burst) {
                     md.start_of_burst = false;
                     _bursting.store(true, std::memory_order_release);
@@ -2014,6 +2273,10 @@ the environment.)">;
         } catch (const std::exception& e) {
             std::fprintf(stderr, "[uhd::Sink] send: %s\n", e.what());
             return false;
+        }
+        if (endsBurst) {
+            _bursting.store(false, std::memory_order_release);
+            _endsPlaced.fetch_add(1, std::memory_order_acq_rel);
         }
         return true;
     }

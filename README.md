@@ -17,9 +17,8 @@ holds the headers the blocks build on, the discovery library's source, the
 case support and `cmake/capture.cmake`, the build logic `uhd/CMakeLists.txt`
 calls. `extract/uhd.imported` lists every file the copy placed; a change to
 one of them is made in libcapture. This copy is of libcapture's master branch
-as of 2026-09-30, at "State the receive antennas of a USRP as a control", with
-the license commit of the same day. Its last change to these files is that
-same commit.
+as of 2026-09-30, at "Send USRP bursts where the tx_eob and tx_time tags place
+them", its last change to these files.
 
 ## Building
 

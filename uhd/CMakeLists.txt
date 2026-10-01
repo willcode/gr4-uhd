@@ -152,6 +152,12 @@ if(CAPTURE_UHD_FOUND)
           sink.uhd-states-the-rate-in-force
           sink.uhd-the-surface-is-read-without-the-control-mutex
           sink.uhd-both-blocks-declare-their-labels
+          sink.uhd-a-burst-ends-at-its-tagged-sample
+          sink.uhd-two-bursts-in-one-buffer-end-at-their-own-samples
+          sink.uhd-a-timed-burst-starts-at-its-time
+          sink.uhd-a-mistyped-burst-tag-is-reported-once
+          sink.uhd-a-stream-end-tag-ends-the-burst-at-the-last-sample
+          sink.uhd-a-stream-end-tag-after-the-last-send-ends-the-burst-alone
     LIBS ${CAPTURE_GR4} ${CAPTURE_UHD_LIB}
     INCLUDES ${CAPTURE_UHD_INCLUDE})
 
@@ -186,7 +192,7 @@ if(CAPTURE_HW_UHD AND CAPTURE_UHD_FOUND)
       uhd.rate-change-midstream uhd.a-drain-at-the-top-rate-ends-by-duration uhd.accessors-after-a-stop uhd.stop-latency
       uhd.coverage-past-the-stated-range uhd.vendor-agc-claim
       uhd.wire-format uhd.transport-sizing uhd.master-clock uhd.tx-burst uhd.tx-loopback
-      uhd.tx-underrun)
+      uhd.tx-underrun uhd.tx-tagged-bursts)
   capture_test(
     hw_uhd
     DIR test
