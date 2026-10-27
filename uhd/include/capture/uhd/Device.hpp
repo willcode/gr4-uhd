@@ -1932,16 +1932,15 @@ HeldForRun<std::remove_cvref_t<decltype(std::declval<const Block&>().channels.va
 }
 
 /*| contract: refuse a write of a setting the run holds fixed. Each such setting in newSettings
-        goes back to the value held, leaves newSettings and forwardSettings, and is named on
-        standard error under blockTag. Called from the settings hook while the device is up.
+        goes back to the value held, leaves newSettings, and is named on standard error under
+        blockTag. Called from the settings hook while the device is up.
     verified-by: controls.uhd-a-running-source-refuses-the-settings-it-runs-on
     verified-by: sink.uhd-a-running-sink-refuses-the-settings-it-runs-on
 */
 template <typename Block, typename Channels, typename Map>
-void refuseRunningWrites(Block& block, const HeldForRun<Channels>& held, Map& newSettings, Map& forwardSettings, std::string_view blockTag) {
+void refuseRunningWrites(Block& block, const HeldForRun<Channels>& held, Map& newSettings, std::string_view blockTag) {
     const auto refuse = [&](std::string_view key, const std::string& kept) {
         newSettings.erase(std::pmr::string(key));
-        forwardSettings.erase(std::pmr::string(key));
         std::fprintf(stderr, "[%s] %s is fixed while the block runs and keeps %s; a write applies while the block is stopped\n", std::string(blockTag).c_str(), std::string(key).c_str(), kept.c_str());
     };
     if (newSettings.contains("sample_rate")) {

@@ -2212,9 +2212,9 @@ int main(int argc, char** argv) {
         capture::uhd::Source src{};
         src._deviceUp.store(true, std::memory_order_release);
         gr::property_map changed{{"frequency", std::vector<double>{433.0e6}}};
-        gr::property_map forward{{"frequency", std::vector<double>{433.0e6}}};
+        gr::property_map forward;
         src.settingsChanged({}, changed, forward);
-        expect(!forward.contains("frequency")) << "the drain forwards no frequency ahead of the first sample the tune reaches";
+        expect(forward.empty()) << "the drain forwards no frequency ahead of the first sample the tune reaches";
         src._deviceUp.store(false, std::memory_order_release);
     });
 
@@ -2728,11 +2728,11 @@ int main(int argc, char** argv) {
         Source src{};
         src._deviceUp.store(true, std::memory_order_release);
         gr::property_map changed{{"lo_offset", 3.0e6}};
-        gr::property_map forward{{"lo_offset", 3.0e6}};
+        gr::property_map forward;
         src.settingsChanged({}, changed, forward);
         expect(src._tuneRequests == 1U) << "a changed offset asks for a retune";
         gr::property_map other{{"emit_timing_tags", false}};
-        gr::property_map otherForward{{"emit_timing_tags", false}};
+        gr::property_map otherForward;
         src.settingsChanged({}, other, otherForward);
         expect(src._tuneRequests == 1U) << "and a setting no tune reads asks for none";
         src._deviceUp.store(false, std::memory_order_release);
@@ -3093,7 +3093,7 @@ int main(int argc, char** argv) {
         std::future<void>  pass = passed.get_future();
         std::thread        consumer([&src, &passed] {
             gr::property_map changed{{"frequency", std::vector<double>{433.0e6}}};
-            gr::property_map forward{{"frequency", std::vector<double>{433.0e6}}};
+            gr::property_map forward;
             src.settingsChanged({}, changed, forward);
             passed.set_value();
         });
@@ -3428,8 +3428,8 @@ int main(int argc, char** argv) {
             expect(a.allEqual && b.allEqual) << "out carries the first channel and out2 the second";
             expect(fatal(!a.tags.empty())) << "the ports carry tags";
             expect(std::ranges::equal(a.tags, b.tags)) << "at the same samples, with the same keys";
-            expect(a.tags.front().first == 0UZ && a.tags.front().second.contains("sample_rate")) << "the rate on the first sample of each";
-            expect(std::ranges::count_if(a.tags, [](const auto& t) { return t.second.contains("trigger_time"); }) == static_cast<std::ptrdiff_t>(count)) << "and a timing tag on every block";
+            expect(a.tags.front().first == 0UZ && a.tags.front().second.contains(std::string(gr::tag::SAMPLE_RATE.key()) + ";")) << "the rate on the first sample of each";
+            expect(std::ranges::count_if(a.tags, [](const auto& t) { return t.second.contains(std::string(gr::tag::TRIGGER_TIME.key()) + ";"); }) == static_cast<std::ptrdiff_t>(count)) << "and a timing tag on every block";
         }
         {
             // With out2 unconnected the second channel is received and dropped.

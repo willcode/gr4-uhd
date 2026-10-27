@@ -468,7 +468,7 @@ struct EndBurstAtStreamEnd : gr::Block<EndBurstAtStreamEnd> {
 
     gr::work::Status processEpilogue(gr::InputSpanLike auto& /*input*/, gr::OutputSpanLike auto& output) {
         if (!gr::lifecycle::isShuttingDown(this->state())) {
-            output.publishTag(gr::property_map{{"tx_eob", true}}, 0UZ);
+            output.publishTag(gr::property_map{{gr::tag::TX_EOB.key(), true}}, 0UZ);
         }
         output.publish(0UZ);
         return gr::work::Status::OK;
@@ -509,8 +509,8 @@ struct BurstPairProbe : gr::Block<BurstPairProbe> {
 
 using BurstTags = std::vector<std::pair<std::size_t, gr::property_map>>;
 
-gr::property_map burstStart() { return {{"tx_sob", true}}; }
-gr::property_map burstEnd() { return {{"tx_eob", true}}; }
+gr::property_map burstStart() { return {{gr::tag::TX_SOB.key(), true}}; }
+gr::property_map burstEnd() { return {{gr::tag::TX_EOB.key(), true}}; }
 
 /*| contract: run n samples carrying tags through a feed, a relay where relayed is set, and the
         probe into rig's sink, and answer whether the run ended by itself. The feed ends its
@@ -1156,11 +1156,11 @@ int main(int argc, char** argv) {
         running.frequency         = std::vector<double>{running._appliedRequestHz - 1.0e6};
         running.lo_offset         = 3.0e6;
         gr::property_map other{{"thread_priority", 0.0}};
-        gr::property_map otherForward{{"thread_priority", 0.0}};
+        gr::property_map otherForward;
         capture::uhd::test::withPlaceholderHandle(running, [&running, &other, &otherForward] { running.settingsChanged({}, other, otherForward); });
         expect(running.frequency.value == std::vector<double>{running._appliedRequestHz - 1.0e6}) << "a setting no tune reads leaves frequency alone";
         gr::property_map changed{{"lo_offset", 3.0e6}};
-        gr::property_map forward{{"lo_offset", 3.0e6}};
+        gr::property_map forward;
         capture::uhd::test::withPlaceholderHandle(running, [&running, &changed, &forward] { running.settingsChanged({}, changed, forward); });
         expect(running.frequency.value == std::vector<double>{running._appliedRequestHz}) << "a changed offset tunes, and the refused tune writes the center in force back";
         running._deviceUp.store(false);
@@ -2425,7 +2425,7 @@ int main(int argc, char** argv) {
         constexpr std::int64_t kNextNs  = 1'720'000'001'000'000'250LL;
         BurstRig               rig;
         rig.startDrain();
-        const BurstTags tags{{300UZ, {{"tx_sob", true}, {"tx_time", static_cast<std::uint64_t>(kFirstNs)}}}, {899UZ, burstEnd()}, {900UZ, {{"tx_time", kNextNs}}}, {1499UZ, burstEnd()}};
+        const BurstTags tags{{300UZ, {{gr::tag::TX_SOB.key(), true}, {gr::tag::TX_TIME.key(), static_cast<std::uint64_t>(kFirstNs)}}}, {899UZ, burstEnd()}, {900UZ, {{gr::tag::TX_TIME.key(), kNextNs}}}, {1499UZ, burstEnd()}};
         expect(runBursts(rig, kSamples, tags)) << "the stream ends and the run returns";
         expect(rig.waitFor(kSamples, 2UZ)) << "the drain sends every sample and both ends";
         expectBurstSends("timed bursts", rig.stream->sends(), kSamples, {899UZ, 1499UZ}, {{300UZ, kFirstNs}, {900UZ, kNextNs}});
@@ -2437,7 +2437,7 @@ int main(int argc, char** argv) {
         gr::MsgPortIn         reports;
         expect(fatal(rig.sink.msgOut.connect(reports).has_value())) << "the case reads the sink's message port";
         rig.startDrain();
-        const BurstTags tags{{100UZ, {{"tx_eob", std::int32_t{1}}}}, {300UZ, {{"tx_time", 1.5}}}, {500UZ, {{"tx_time", std::int64_t{-1}}}}};
+        const BurstTags tags{{100UZ, {{gr::tag::TX_EOB.key(), std::int32_t{1}}}}, {300UZ, {{gr::tag::TX_TIME.key(), 1.5}}}, {500UZ, {{gr::tag::TX_TIME.key(), std::int64_t{-1}}}}};
         expect(runBursts(rig, kSamples, tags)) << "the stream ends and the run returns";
         expect(rig.waitFor(kSamples, 0UZ)) << "the drain sends every sample";
         expectBurstSends("mistyped tags", rig.stream->sends(), kSamples, {}, {});
@@ -2453,7 +2453,7 @@ int main(int argc, char** argv) {
         }
         std::ignore = messages.consume(messages.size());
         expect(fatal(errors.size() == 1UZ)) << "one report for the run";
-        expect(errors.front().contains("tx_eob") && errors.front().contains("100")) << "naming the first mistyped tag and its sample: " << errors.front();
+        expect(errors.front().contains(gr::tag::TX_EOB.key()) && errors.front().contains("100")) << "naming the first mistyped tag and its sample: " << errors.front();
     });
 
     cases("sink.uhd-a-stream-end-tag-ends-the-burst-at-the-last-sample", [] {
@@ -2560,7 +2560,7 @@ int main(int argc, char** argv) {
         const std::complex<float>   second{0.0f, 0.25f};
         BurstRig                    rig(65536UZ, 2UZ);
         rig.startDrain();
-        const BurstTags tags2{{300UZ, {{"tx_time", kTimeNs}}}, {899UZ, burstEnd()}, {1499UZ, burstEnd()}};
+        const BurstTags tags2{{300UZ, {{gr::tag::TX_TIME.key(), kTimeNs}}}, {899UZ, burstEnd()}, {1499UZ, burstEnd()}};
         expect(runBurstPair(rig, kSamples, {}, tags2, second)) << "the stream ends and the run returns";
         expect(rig.waitFor(kSamples, 2UZ)) << "the drain sends every sample and both ends";
         const auto sends = rig.stream->sends();

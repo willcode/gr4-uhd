@@ -23,7 +23,8 @@
 #include <utility>
 
 /*| role: the publish side every device source block shares: the hold-and-retry publish, the
-        rate tag on a stream's first block, the periodic timing tag and the gap marker.
+        rate and frequency tags on a stream's first block, the periodic timing tag and the gap
+        marker.
 */
 namespace capture {
 
@@ -109,7 +110,7 @@ void publishOutputTag(Block& blk, TagMap&& tagMap, std::size_t offset) {
 }
 
 /*| contract: publish the gap marker at the head of the block the gap falls in front of, with
-        the cause beside it where the caller names one. rx_overflow says a gap occurred and
+        the cause beside it where the caller names one. gr:rx_overflow says a gap occurred and
         rx_overflow_cause names what caused it; a caller naming nothing publishes the key alone.
     frame: a cause is a short phrase in the device library's words, "restart" or "lost packet".
     verified-by: publish.a-marker-carries-the-cause-where-one-is-named
@@ -117,24 +118,26 @@ void publishOutputTag(Block& blk, TagMap&& tagMap, std::size_t offset) {
 template <typename Block>
 void emitOverflowTag(Block& blk, std::string_view cause = {}) {
     auto tagMap = blk.out.makeTagMap();
-    gr::tag::put(tagMap, "rx_overflow", true);
+    gr::tag::put(tagMap, gr::tag::RX_OVERFLOW, true);
     if (!cause.empty()) {
         gr::tag::put(tagMap, "rx_overflow_cause", std::string(cause));
     }
     publishOutputTag(blk, std::move(tagMap), 0UZ);
 }
 
-/*| contract: publish the tags the first sample of a block carries: sample_rate on the first
-        block a stream publishes after its start, the value of the block's own sample_rate
-        setting, and the periodic timing tag stamped tWallNs where tagDecision says one is due.
-        Every source writes the rate the device runs into that setting before it streams, a
-        rate the device snapped included.
+/*| contract: publish the tags the first sample of a block carries. The first block a stream
+        publishes after its start carries gr:sample_rate, the value of the block's own
+        sample_rate setting, and gr:frequency, the first entry of its frequency setting where
+        that setting holds one. A block carries the periodic timing tag stamped tWallNs where
+        tagDecision says one is due. Every source writes the rate the device runs into its
+        sample_rate setting before it streams, a rate the device snapped included.
     contract: tWallNs is a time in nanoseconds or a callable returning one. A callable runs only
         where the block emits timing tags, and a block with no tag due builds no tag map.
     frame: the tags go on the sample at the writer's position, the first sample the next
         publish hands downstream, so a caller holding a reservation publishes them before it
         publishes the reservation.
     verified-by: publish.the-first-block-of-a-stream-carries-the-rate-in-force
+    verified-by: publish.the-first-block-of-a-stream-carries-the-frequency-in-force
     verified-by: publish.a-block-with-no-tag-due-reads-no-clock
 */
 template <typename Block, typename WallNs>
@@ -158,6 +161,9 @@ void publishBlockHeadTags(Block& blk, WallNs&& tWallNs) {
     auto tagMap = blk.out.makeTagMap();
     if (rateOwed) {
         gr::tag::put(tagMap, gr::tag::SAMPLE_RATE, blk.sample_rate.value);
+        if (!blk.frequency.value.empty()) {
+            gr::tag::put(tagMap, gr::tag::FREQUENCY, blk.frequency.value.front());
+        }
     }
     if (timing) {
         gr::tag::put(tagMap, gr::tag::TRIGGER_NAME, blk.trigger_name.value);

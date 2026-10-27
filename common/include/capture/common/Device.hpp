@@ -67,12 +67,12 @@ constexpr double correctedTuneHz(double requestHz, double ppm) { return requestH
 struct OutputState {
     std::atomic<bool>        connectedAtStart{false};
     std::atomic<std::size_t> droppedTags{0};   // the port's refused-tag count, as last published
-    std::atomic<bool>        rateTagOwed{false}; // the stream's first block carries sample_rate
+    std::atomic<bool>        rateTagOwed{false}; // the stream's first block carries gr:sample_rate, and gr:frequency where the frequency setting holds one
 };
 
 /*| contract: record whether the block's output port had a reader when the block started, and
-        owe the stream that starts the rate in force as a tag on its first block. Each source
-        calls this first in its start().
+        owe the stream that starts the rate and frequency in force as tags on its first block.
+        Each source calls this first in its start().
     frame: the scheduler connects every edge of a graph before it starts a block. A port that
         reads unconnected here was never given a consumer.
 */

@@ -82,15 +82,15 @@ first device channel the channels setting lists, and in2 the second where it lis
 connected exactly when two channels are listed. The device list asks libuhd with use_dpdk=1
 where CAPTURE_UHD_USE_DPDK is set in the environment.
 
-Three tags on the input mark transmit bursts. A send ends at a sample tagged tx_eob = true
-and carries end_of_burst. The first send after an end carries start_of_burst, and tx_sob asks
-for nothing more. A send starts at a sample tagged tx_time and carries that time as its
+Three tags on the input mark transmit bursts. A send ends at a sample tagged gr:tx_eob = true
+and carries end_of_burst. The first send after an end carries start_of_burst, and gr:tx_sob asks
+for nothing more. A send starts at a sample tagged gr:tx_time and carries that time as its
 time_spec: a count of nanoseconds on the device clock, any integer type. The block sets no
-device clock. A tx_eob = true can also arrive with the end of the stream, one past its last
+device clock. A gr:tx_eob = true can also arrive with the end of the stream, one past its last
 sample. It ends the burst at the last sample the block staged. When the device has already
 taken that sample, a send of one zero sample carries end_of_burst. Under a stop request the
 end of the stream ends no burst, and the stop ends the burst itself. The block ignores a
-tx_eob that is not a bool and a tx_time that is not an integer from 0 to 2^63 - 1. It
+gr:tx_eob that is not a bool and a gr:tx_time that is not an integer from 0 to 2^63 - 1. It
 reports the first such tag of a run on its message port. Other tags are ignored. With two
 channels one send carries both, so a burst tag on either input marks the burst on both.)">;
 
@@ -98,8 +98,8 @@ channels one send carries both, so a burst tag on either input marks the burst o
     gr::PortIn<std::complex<float>, gr::Optional> in2;
 
     static constexpr const char* kDevice = "uhd"; // the family name a device listing and a probe carry
-    static constexpr std::string_view kTxEob  = "tx_eob";  // the burst ends at this sample
-    static constexpr std::string_view kTxTime = "tx_time"; // the send starts at this sample, at this time
+    static constexpr std::string_view kTxEob  = gr::tag::TX_EOB.key();  // the burst ends at this sample
+    static constexpr std::string_view kTxTime = gr::tag::TX_TIME.key(); // the send starts at this sample, at this time
     static constexpr bool        kListingOpens = false; // the listing asks libuhd, which opens no unit
     static constexpr double      kDefaultRateHz      = 2'000'000.0;
     static constexpr double      kDefaultFrequencyHz = 100'000'000.0;
@@ -1437,13 +1437,13 @@ channels one send carries both, so a burst tag on either input marks the burst o
     /*| contract: frequency, LO offset, gain and connector reach the device live. A write of a setting the
             run holds fixed is refused, as refuseRunningWrites states.
     */
-    void settingsChanged(const gr::property_map& /*oldSettings*/, gr::property_map& newSettings, gr::property_map& forwardSettings) {
+    void settingsChanged(const gr::property_map& /*oldSettings*/, gr::property_map& newSettings, gr::property_map& /*forwardSettings*/) {
         const ControlSurfaceCheck<Sink> surfaceCheck{*this}; // sends a moved surface once the body has let go of its locks
         if (!_deviceUp.load(std::memory_order_acquire)) {
             return;
         }
         if (_heldForRun.has_value()) {
-            refuseRunningWrites(*this, *_heldForRun, newSettings, forwardSettings, "uhd::Sink");
+            refuseRunningWrites(*this, *_heldForRun, newSettings, "uhd::Sink");
         }
         std::lock_guard lock(_ctrlMutex);
         if (_usrp == nullptr) {

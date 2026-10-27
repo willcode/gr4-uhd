@@ -8,8 +8,8 @@ reads or replaces one, the allocator its storage takes and the doorbell a consum
 it depends on nothing. `Device.hpp` holds the parts a block needs
 whichever direction it runs in: the streaming-thread guard, the teardown guard, the control
 guard and the duties a source owes its output port, with `Ring.hpp` carried through it.
-`Source.hpp` holds the publish side — the hold-and-retry publish, the rate tag on a stream's
-first block, the wall clock its periodic timing tag is read from, and the gap marker beside
+`Source.hpp` holds the publish side — the hold-and-retry publish, the rate and frequency tags
+on a stream's first block, the wall clock its periodic timing tag is read from, and the gap marker beside
 it — and every source carries `Device.hpp` through it while every sink includes `Device.hpp`
 directly. `Sink.hpp`
 holds the transmit vocabulary: the clip, the queue sizing and its bound, and the counters. `ControlDesc.hpp`
@@ -86,8 +86,9 @@ released, because the edge takes the samples at the release; a reader woken earl
 find nothing. The appliers write the device under one control mutex.
 
 **io**
-Settings in and CF32 out, with the rate in force as a `sample_rate` tag on the first block
-of every stream, a periodic timing tag and an `rx_overflow` marker on every discontinuity.
+Settings in and CF32 out. The first block of every stream carries the rate and the frequency
+in force as `gr:sample_rate` and `gr:frequency` tags. A periodic timing tag goes out, and a
+`gr:rx_overflow` marker on every discontinuity.
 `describeControls()` states the control surface; `setControl` and `setElementGain` apply
 it. The message properties of the shared files answer that surface, those writes and those
 readings to a caller outside the graph. `readSensors()` publishes what the device and the
@@ -366,8 +367,8 @@ hooks — `start`, `stop`, `pause`, `resume` — open the device, release it, ta
 down and bring it back.
 
 **io**
-CF32 in, full scale 1.0 in each part. A sink reads the burst tags `tx_sob`, `tx_eob` and
-`tx_time` where its family's knowledge says so, and ignores every other tag. Settings in — the
+CF32 in, full scale 1.0 in each part. A sink reads the burst tags `gr:tx_sob`, `gr:tx_eob` and
+`gr:tx_time` where its family's knowledge says so, and ignores every other tag. Settings in — the
 source's names, with the `tx_` prefix for what a transmitter has and none for what it has
 not, so one caller drives both directions identically. `enumerateDevices()` offers the pairs
 the source offers, from one body both families call. `describeControls()` states the transmit

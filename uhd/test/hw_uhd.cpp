@@ -213,13 +213,13 @@ double neighborDbfs() {
 void countTag(const gr::property_map& map, std::size_t index) {
     for (const auto& [key, value] : map) {
         const std::string_view k(key.data(), key.size());
-        if (k == "rx_overflow" || k == "gr:rx_overflow") {
+        if (k == gr::tag::RX_OVERFLOW.key()) {
             g_overflowTags.fetch_add(1, std::memory_order_relaxed);
             std::lock_guard g(g_tagLock);
             g_markerAt.push_back(index);
-        } else if (k == "end_of_stream" || k == "gr:end_of_stream") {
+        } else if (k == gr::tag::END_OF_STREAM.key()) {
             g_eosTags.fetch_add(1, std::memory_order_relaxed);
-        } else if (k == "trigger_time" || k == "gr:trigger_time") {
+        } else if (k == gr::tag::TRIGGER_TIME.key()) {
             if (const std::uint64_t* t = value.get_if<std::uint64_t>(); t != nullptr) {
                 std::uint64_t none = 0UL;
                 g_firstTriggerNs.compare_exchange_strong(none, *t);
@@ -227,7 +227,7 @@ void countTag(const gr::property_map& map, std::size_t index) {
                 g_tagTimes.push_back({.timeNs = *t, .index = index, .seenWallNs = capture::wallClockNs()});
             }
             g_timingTags.fetch_add(1, std::memory_order_relaxed);
-        } else if (k == "sample_rate" || k == "gr:sample_rate") {
+        } else if (k == gr::tag::SAMPLE_RATE.key()) {
             g_rateTags.fetch_add(1, std::memory_order_relaxed);
             if (const double* r = value.get_if<double>(); r != nullptr) {
                 g_lastRateTagHz.store(*r, std::memory_order_relaxed);
@@ -563,7 +563,7 @@ bool withGraph(gr::property_map settings, Body&& body) {
     for (const gr::Tag& tag : tags) {
         for (const auto& [key, value] : tag.map) {
             const std::string_view k(key.data(), key.size());
-            if ((k == "end_of_stream" || k == "gr:end_of_stream") && value.get_if<bool>() != nullptr) {
+            if (k == gr::tag::END_OF_STREAM.key() && value.get_if<bool>() != nullptr) {
                 g_eosTags.fetch_add(1, std::memory_order_relaxed);
             }
         }
@@ -636,11 +636,11 @@ struct [[maybe_unused]] hw_port_sink : gr::Block<hw_port_sink> {
         for (const gr::Tag& tag : inSpan.rawTags) {
             for (const auto& [key, value] : tag.map) {
                 const std::string_view k(key.data(), key.size());
-                if (k == "rx_overflow" || k == "gr:rx_overflow") {
+                if (k == gr::tag::RX_OVERFLOW.key()) {
                     ++r.markers;
-                } else if (k == "sample_rate" || k == "gr:sample_rate") {
+                } else if (k == gr::tag::SAMPLE_RATE.key()) {
                     r.rateAt.push_back(tag.index);
-                } else if (const std::uint64_t* t = value.get_if<std::uint64_t>(); t != nullptr && (k == "trigger_time" || k == "gr:trigger_time")) {
+                } else if (const std::uint64_t* t = value.get_if<std::uint64_t>(); t != nullptr && k == gr::tag::TRIGGER_TIME.key()) {
                     r.timing.emplace_back(tag.index, *t);
                 }
             }
@@ -822,16 +822,16 @@ struct [[maybe_unused]] hw_burst_tone : gr::Block<hw_burst_tone> {
             const std::uint64_t at    = index % burstSamples;
             gr::property_map    tag;
             if (at == 0U) {
-                tag["tx_sob"] = true;
+                tag[gr::tag::TX_SOB.key()] = true;
                 if (index / burstSamples == 1U && deviceNowNs) {
                     if (const auto now = deviceNowNs(); now.has_value()) {
                         timedAtNs      = *now + leadNs;
-                        tag["tx_time"] = *timedAtNs;
+                        tag[gr::tag::TX_TIME.key()] = *timedAtNs;
                     }
                 }
             }
             if (at + 1U == burstSamples) {
-                tag["tx_eob"] = true;
+                tag[gr::tag::TX_EOB.key()] = true;
             }
             if (!tag.empty()) {
                 output.publishTag(tag, i);

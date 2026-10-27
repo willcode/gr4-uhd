@@ -144,10 +144,11 @@ private:
         streams one or two device channels and states a control surface read from the open
         unit.
     contract: out carries the first channel the channels setting lists and out2 the second.
-        The first block of a stream carries sample_rate. A block carries the timing tag named
-        trigger_name where tag_interval has passed, stamped with the time the device stamped
-        its first sample. The first block after a gap carries rx_overflow with the cause in
-        rx_overflow_cause. The first sample a retune reaches carries the new frequency.
+        The first block of a stream carries gr:sample_rate and gr:frequency, the rate and the
+        frequency in force. A block carries the timing tag named trigger_name where
+        tag_interval has passed, stamped with the time the device stamped its first sample. The first block after a gap carries gr:rx_overflow with the
+        cause in rx_overflow_cause. The first sample a retune reaches carries the new
+        gr:frequency.
     contract: frequency, frequency_correction, lo_offset, rx_gains, gain_mode and rx_antennae
         reach a streaming device on the block's control thread, one write at a time in the
         order given. sample_rate, channels, wire_format, master_clock_rate, clock_source and
@@ -1859,7 +1860,7 @@ environment.)">;
             hands back.
         verified-by: controls.uhd-a-retune-forwards-nothing-ahead-of-its-samples
     */
-    void settingsChanged(const gr::property_map& /*oldSettings*/, gr::property_map& newSettings, gr::property_map& forwardSettings) {
+    void settingsChanged(const gr::property_map& /*oldSettings*/, gr::property_map& newSettings, gr::property_map& /*forwardSettings*/) {
         const ControlSurfaceCheck<Source> surfaceCheck{*this}; // sends a moved surface once the body has let go of its locks
         if (newSettings.contains("gain_mode")) {
             _surfaceAgc.store(gain_mode.value, std::memory_order_release);
@@ -1870,10 +1871,9 @@ environment.)">;
             return;
         }
         if (_heldForRun.has_value()) {
-            refuseRunningWrites(*this, *_heldForRun, newSettings, forwardSettings, "uhd::Source");
+            refuseRunningWrites(*this, *_heldForRun, newSettings, "uhd::Source");
         }
         if (newSettings.contains("frequency") || newSettings.contains("frequency_correction") || newSettings.contains("lo_offset")) {
-            forwardSettings.erase(std::pmr::string("frequency"));
             if (!frequency->empty()) {
                 const std::uint64_t request = ++_tuneRequests;
                 _control.post(kControlFrequency, [this, request, want = frequency->front(), ppm = frequency_correction.value, offset = lo_offset.value] { retune(request, want, ppm, offset); });
@@ -2782,7 +2782,7 @@ environment.)">;
         for (const auto& [offset, hz] : tags) {
             at          = std::max(at, offset);
             auto tagMap = out.makeTagMap();
-            gr::tag::put(tagMap, "frequency", hz);
+            gr::tag::put(tagMap, gr::tag::FREQUENCY, hz);
             publishOutputTag(*this, std::move(tagMap), at);
         }
         if (_secondPublished) {
