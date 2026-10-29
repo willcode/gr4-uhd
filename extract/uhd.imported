@@ -3,7 +3,7 @@
 #
 # The files the last import from libcapture placed in this tree, one path per line.
 # extract/copy.py writes this file and reads it at the next import.
-# This copy is of libcapture as of 2026-10-27, at "Write and read tag keys in the gr: domain", its last change to these files.
+# This copy is of libcapture as of 2026-10-28, at "Name no device family in the shared contract and knowledge", its last change to these files.
 uhd/CMakeLists.txt
 uhd/README.md
 uhd/include/capture/uhd/Device.hpp

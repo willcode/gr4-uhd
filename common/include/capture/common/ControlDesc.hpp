@@ -262,7 +262,6 @@ inline ControlDesc controlFromSeed(const ControlSeed& d) {
         value outlives the state it was stored under, so the bound belongs wherever such a value
         is read as well as where it is written.
     verified-by: controls.bandwidth-ceiling-per-rate
-    verified-by: controls.uhd-a-clock-span-takes-any-clock-in-it
 */
 inline double clampToControl(const ControlDesc& d, double value) {
     if (value != value) {

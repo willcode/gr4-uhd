@@ -621,8 +621,8 @@ request and calls `processScheduledMessages()` on the model from its own thread.
 - `appliesAt` on a descriptor says when a write takes effect: `Runtime` in the running
   stream, `Start` at the next start of the stream. `setControl` refuses a write to a stopped
   block. A family either keeps a `Start` write made while the device is up for the next start,
-  or takes only the value in force and refuses any other, as its README states; the USRP
-  source refuses. A caller that builds
+  or takes only the value in force and refuses any other, as its README states. A caller
+  that builds
   a new block for the next start passes the value as the open-time setting the family's
   README names for the control. `Runtime` is the default of a seed and of a descriptor, and
   `controlFromMap` reads it for a map without `applies_at` and for any word there other than
