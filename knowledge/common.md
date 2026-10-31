@@ -196,8 +196,11 @@ while the device is open reaches nothing.
   back out of any frequency correction the block applied as a scaled tune, so a caller can
   write the stated value back without the correction being applied twice. Before the first
   tune of a session there is no such value: the tuner sits where an earlier program left it,
-  so a refusal at that point forwards nothing rather than a number the device never took. A
-  device whose coverage moves with the sample rate states it again at every rate change,
+  so a refusal at that point forwards nothing rather than a number the device never took.
+  After a control write or a failed re-tune that leaves the block no tune it can state, as a
+  change of sampling path away from the held frequency does, the block forwards nothing
+  until a tune lands.
+  A device whose coverage moves with the sample rate states it again at every rate change,
   because a request legal at one rate falls outside the radio at another. Where a local
   oscillator is deliberately offset from the center, the coverage has to hold the frequency
   the offset puts the frontend at rather than the center alone: a vendor library coerces a
