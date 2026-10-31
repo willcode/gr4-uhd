@@ -63,7 +63,7 @@ gr::DeviceListing coreListing(BlockList<TFirst, TRest...> /*blocks*/) {
 
 /*| contract: add the listing of the family TBlocks states to the process's device listing
         registry, and answer whether the registry took it. A registration of the same family
-        word that came first holds the word, and this one is then refused and recorded there.
+        word that came first holds the word, and the registry then refuses this one.
 */
 template <typename TBlocks>
 bool registerCoreListing() {
