@@ -16,6 +16,8 @@
 #include <concepts>
 #include <cstdint>
 #include <cstring>
+#include <limits>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -112,15 +114,22 @@ void publishOutputTag(Block& blk, TagMap&& tagMap, std::size_t offset) {
 /*| contract: publish the gap marker at the head of the block the gap falls in front of, with
         the cause beside it where the caller names one. gr:rx_overflow says a gap occurred and
         rx_overflow_cause names what caused it; a caller naming nothing publishes the key alone.
+    contract: where the caller counts the samples the gap lost, gr:n_dropped_samples carries
+        the count as a gr::Size_t, held at that type's largest value.
     frame: a cause is a short phrase in the device library's words, "restart" or "lost packet".
+        The count is in samples of one output port.
     verified-by: publish.a-marker-carries-the-cause-where-one-is-named
+    verified-by: publish.a-marker-carries-the-count-where-one-is-given
 */
 template <typename Block>
-void emitOverflowTag(Block& blk, std::string_view cause = {}) {
+void emitOverflowTag(Block& blk, std::string_view cause = {}, std::optional<std::uint64_t> droppedSamples = std::nullopt) {
     auto tagMap = blk.out.makeTagMap();
     gr::tag::put(tagMap, gr::tag::RX_OVERFLOW, true);
     if (!cause.empty()) {
         gr::tag::put(tagMap, "rx_overflow_cause", std::string(cause));
+    }
+    if (droppedSamples.has_value()) {
+        gr::tag::put(tagMap, gr::tag::N_DROPPED_SAMPLES, static_cast<gr::Size_t>(std::min<std::uint64_t>(*droppedSamples, std::numeric_limits<gr::Size_t>::max())));
     }
     publishOutputTag(blk, std::move(tagMap), 0UZ);
 }

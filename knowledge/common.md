@@ -129,9 +129,9 @@ while the device is open reaches nothing.
   carries its count forward rather than restarting it, so the difference between two reads is
   the loss between them. One marker goes out on the first block published after a loss,
   however the loss arose, and losses that fall before that block share it, naming the latest
-  cause where the family names one. A marker the output port had no room for is counted, and
-  every source reports the count, because a stream missing its marker reads as a continuous
-  one.
+  cause where the family names one, and carrying gr:n_dropped_samples where the family puts
+  its count there. A marker the output port had no room for is counted, and every source
+  reports the count, because a stream missing its marker reads as a continuous one.
 - A discontinuity marker sits at the head of the block the gap falls in front of. A ring
   that refuses the newest chunk refuses only while it is full, so the samples it sheds come
   after every sample already in it: the loss is noticed on one block and belongs to the
