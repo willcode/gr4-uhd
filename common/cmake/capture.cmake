@@ -412,11 +412,12 @@ if(CAPTURE_TESTS)
       # Every case here is arithmetic or a few thousand samples. The ceiling is a stuck
       # test, not a slow one.
       set_tests_properties(${case} PROPERTIES TIMEOUT 15 LABELS ${CAPTURE_TEST_LABEL})
-      # A case that builds a gr::Graph loads every block library in the directories
-      # GNURADIO4_PLUGIN_DIRECTORIES names, or in the core's installed plugin directory
-      # where the variable is unset. An installed library can link another build of a
-      # vendor library than this tree's. Two builds of one vendor library in one process
-      # can abort it at exit. Each case loads this tree's own block libraries.
+      # A case that builds a graph, as a gr::Graph or a gr::RuntimeGraph, loads every
+      # block library in the directories GNURADIO4_PLUGIN_DIRECTORIES names, or in the
+      # core's installed plugin directory where the variable is unset. An installed
+      # library can link another build of a vendor library than this tree's. Two builds
+      # of one vendor library in one process can abort it at exit. Each case loads this
+      # tree's own block libraries.
       set_property(TEST ${case} PROPERTY ENVIRONMENT_MODIFICATION
                                          "GNURADIO4_PLUGIN_DIRECTORIES=set:${PROJECT_BINARY_DIR}/lib/gnuradio-4/plugins")
     endforeach()

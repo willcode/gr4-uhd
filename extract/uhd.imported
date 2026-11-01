@@ -3,7 +3,7 @@
 #
 # The files the last import from libcapture placed in this tree, one path per line.
 # extract/copy.py writes this file and reads it at the next import.
-# This copy is of libcapture as of 2026-10-31, at "Keep a refused first RTL-SDR tune as asked, and forward nothing", its last change to these files.
+# This copy is of libcapture as of 2026-10-31, at "Build the graphs of the stream and hardware cases by name", its last change to these files.
 uhd/CMakeLists.txt
 uhd/README.md
 uhd/include/capture/uhd/Device.hpp
