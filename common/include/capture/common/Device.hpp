@@ -21,6 +21,7 @@
 #include <deque>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <source_location>
 #include <string>
 #include <string_view>
@@ -68,11 +69,17 @@ struct OutputState {
     std::atomic<bool>        connectedAtStart{false};
     std::atomic<std::size_t> droppedTags{0};   // the port's refused-tag count, as last published
     std::atomic<bool>        rateTagOwed{false}; // the stream's first block carries gr:sample_rate, and gr:frequency where the frequency setting holds one
+    // A gap marker no publish has placed yet, its cause and its count. The publishing thread
+    // writes them, and noteOutputAtStart() clears them before that thread starts.
+    bool                         gapOwed  = false;
+    const char*                  gapCause = nullptr;
+    std::optional<std::uint64_t> gapCount;
 };
 
 /*| contract: record whether the block's output port had a reader when the block started, and
         owe the stream that starts the rate and frequency in force as tags on its first block.
-        Each source calls this first in its start().
+        Each source calls this in its start() before its publishing thread starts, after any
+        teardown that joins the thread of the stream before.
     frame: the scheduler connects every edge of a graph before it starts a block. A port that
         reads unconnected here was never given a consumer.
 */
@@ -80,6 +87,7 @@ template <typename Block>
 void noteOutputAtStart(Block& blk) {
     blk._outputState.connectedAtStart.store(blk.out.isConnected(), std::memory_order_release);
     blk._outputState.rateTagOwed.store(true, std::memory_order_release);
+    blk._outputState.gapOwed = false;
 }
 
 /*| contract: true where the block's output port reaches nothing, having asked the block to

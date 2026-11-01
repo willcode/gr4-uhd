@@ -3,7 +3,7 @@
 #
 # The files the last import from libcapture placed in this tree, one path per line.
 # extract/copy.py writes this file and reads it at the next import.
-# This copy is of libcapture as of 2026-11-01, at "Count a lost AD9361 buffer and keep the filter the radio holds", its last change to these files.
+# This copy is of libcapture as of 2026-11-01, at "Report every source's losses in one form", its last change to these files.
 uhd/CMakeLists.txt
 uhd/README.md
 uhd/include/capture/uhd/Device.hpp
@@ -38,6 +38,7 @@ common/src/common/DiscoveryLibrary.cpp
 common/test/support/Cases.hpp
 common/test/support/Held.hpp
 common/test/support/Labels.hpp
+common/test/support/Losses.hpp
 common/test/support/Readings.hpp
 common/test/support/ScheduledGraph.hpp
 common/test/support/Surface.hpp

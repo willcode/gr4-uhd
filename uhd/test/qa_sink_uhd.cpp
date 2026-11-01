@@ -19,6 +19,7 @@
 #include "support/Cases.hpp"
 #include "support/Labels.hpp"
 #include "support/Held.hpp"
+#include "support/Losses.hpp"
 #include "support/Readings.hpp"
 #include "support/ScheduledGraph.hpp"
 
@@ -852,8 +853,10 @@ int main(int argc, char** argv) {
         */
         capture::uhd::Source src;
         src._seqErrors.store(2U);
+        src._dropped.store(1068U);
         std::vector<capture::SensorReading> rx;
         src.appendReadings(rx);
+        capture::test::expectLossReadings(rx, 1068U, 0UZ, "a USRP");
         expect(capture::test::readingIds(rx) == std::vector<std::string>{"rx_overflows", "rx_dropped_samples", "rx_sequence_errors", "rx_dropped_markers"}) << "what the receive stream has lost";
         expect(capture::test::briefLabels(rx) == std::vector<std::string>{"Overflows", "Dropped samples"}) << "the overflows and the dropped samples on the glance rows";
         expect(capture::test::readingOf(rx, "rx_sequence_errors").label == "Lost packets" && capture::test::readingOf(rx, "rx_sequence_errors").value == "2") << "the link's losses are a diagnostic";

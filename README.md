@@ -135,7 +135,18 @@ the scheduler's message output under the same endpoint and client request id.
   `{sweep: "full"}` reads every sensor the device has. The first reading is
   the stream state, `rx_stream_state` or `tx_stream_state`, whose `good` is
   true while the device streams. The source also states
-  `rx_analog_bandwidth`, the analog filter in force in hertz.
+  `rx_dropped_samples`, the samples the radio shed as the stream's stamps
+  measure them, on a glance row; `rx_dropped_markers`, the tags the output
+  port had no room for, on a detail row; and `rx_analog_bandwidth`, the
+  analog filter in force in hertz. A count reads good.
+
+The source puts `gr:rx_overflow` on the first block after a gap, with
+`rx_overflow_cause` naming it: `overflow`, `lost packet`, `retune` or
+`missing samples`. Where the block's stamp measures the gap, the tag also
+carries `gr:n_dropped_samples`, the samples the radio shed since the block
+before it. The counts sum to `rx_dropped_samples`. The first block of a
+stream, the first after a rate change and a block measured across a
+device-clock set carry no count.
 
 A source whose frontend carries an automatic gain control states `GAIN_MODE`,
 a toggle at the `gain_mode` the block holds, and a `control` write of it

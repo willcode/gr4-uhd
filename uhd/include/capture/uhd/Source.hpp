@@ -147,8 +147,8 @@ private:
         The first block of a stream carries gr:sample_rate and gr:frequency, the rate and the
         frequency in force. A block carries the timing tag named trigger_name where
         tag_interval has passed, stamped with the time the device stamped its first sample. The first block after a gap carries gr:rx_overflow with the
-        cause in rx_overflow_cause. The first sample a retune reaches carries the new
-        gr:frequency.
+        cause in rx_overflow_cause, and gr:n_dropped_samples where the stamps measure the
+        shed. The first sample a retune reaches carries the new gr:frequency.
     contract: frequency, frequency_correction, lo_offset, rx_gains, gain_mode and rx_antennae
         reach a streaming device on the block's control thread, one write at a time in the
         order given. sample_rate, channels, wire_format, master_clock_rate, clock_source and
@@ -815,6 +815,20 @@ environment.)">;
             return 0UL;
         }
         return shedBetween(expected, arrived, rateNow);
+    }
+
+    /*| contract: the count the gap marker of one block carries: shed, the samples its stamp
+            says the radio shed since the block before it, where shedForBlock can measure them.
+            Nothing for a block with no stamp or an expectation that cannot speak.
+        frame: each block's shed is measured against the end of the block before it. The
+            counts of a stream's markers sum to droppedSamples().
+        verified-by: controls.uhd-a-gap-marker-counts-what-the-stamps-measure
+    */
+    static std::optional<std::uint64_t> markerCountFor(bool stamped, bool haveExpected, bool clockPending, double rateNow, double expectedRate, std::uint64_t shed) {
+        if (!stamped || !haveExpected || clockPending || !(rateNow > 0.0) || rateNow != expectedRate) {
+            return std::nullopt;
+        }
+        return shed;
     }
 
     // How long the block waits for a device-clock set to reach the stream, in milliseconds.
@@ -1491,9 +1505,9 @@ environment.)">;
         if (const std::string depth = recvDepth().describe(); !depth.empty()) {
             out.push_back({.id = "rx_transport_depth", .label = "Receive transport", .value = depth, .good = true, .brief = false});
         }
-        out.push_back({.id = "rx_dropped_samples", .label = "Dropped samples", .value = std::format("{}", droppedSamples()), .good = true, .brief = true});
+        out.push_back(droppedSamplesReading(droppedSamples()));
         out.push_back({.id = "rx_sequence_errors", .label = "Lost packets", .value = std::format("{}", sequenceErrors()), .good = true, .brief = false});
-        out.push_back({.id = "rx_dropped_markers", .label = "Lost markers", .value = std::format("{}", droppedTags()), .good = true, .brief = false});
+        out.push_back(droppedMarkersReading(droppedTags()));
         if (const double filterHz = analogBandwidthHz(); filterHz > 0.0) {
             out.push_back(analogBandwidthReading(filterHz));
         }
@@ -2913,10 +2927,12 @@ environment.)">;
                     measured against an expectation formed before a device-clock set moved the
                     clock the stamps come from.
             */
-            const bool    clockPending = _clockSetPending.load(std::memory_order_acquire);
-            std::uint64_t shedHere     = 0;
+            const bool                   clockPending = _clockSetPending.load(std::memory_order_acquire);
+            std::uint64_t                shedHere     = 0;
+            std::optional<std::uint64_t> markerCount;
             if (const double rateNow = static_cast<double>(sample_rate.value); md.has_time_spec && rateNow > 0.0) {
-                shedHere = shedForBlock(haveExpected, clockPending, rateNow, expectedRate, expectedAt, md.time_spec);
+                shedHere    = shedForBlock(haveExpected, clockPending, rateNow, expectedRate, expectedAt, md.time_spec);
+                markerCount = markerCountFor(true, haveExpected, clockPending, rateNow, expectedRate, shedHere);
                 if (shedHere != 0UL) {
                     _dropped.fetch_add(shedHere, std::memory_order_relaxed);
                 }
@@ -2939,7 +2955,7 @@ environment.)">;
             const auto gaps    = _overflows.load(std::memory_order_relaxed) + _seqErrors.load(std::memory_order_relaxed);
             const bool gapHere = gaps != gapsSeen || shedHere != 0UL;
             if (const auto cause = gapMarkerFor(gaps != gapsSeen, _lastGapCause.load(std::memory_order_relaxed), shedHere, _retunesOpen.load(std::memory_order_acquire) > 0)) {
-                emitOverflowTag(*this, gapCauseName(*cause));
+                emitOverflowTag(*this, gapCauseName(*cause), markerCount);
             }
             gapsSeen = gaps;
 

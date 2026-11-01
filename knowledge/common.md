@@ -129,9 +129,15 @@ while the device is open reaches nothing.
   carries its count forward rather than restarting it, so the difference between two reads is
   the loss between them. One marker goes out on the first block published after a loss,
   however the loss arose, and losses that fall before that block share it, naming the latest
-  cause where the family names one, and carrying gr:n_dropped_samples where the family puts
-  its count there. A marker the output port had no room for is counted, and every source
-  reports the count, because a stream missing its marker reads as a continuous one.
+  cause where the family names one. It carries gr:n_dropped_samples, the samples lost since
+  the last marker. The counts of a stream's markers sum to the loss they cover. A marker
+  whose gap has no measured size carries no count: a report that states no length, a counter
+  step of unknown size, a block with no stamp to measure against, a restart a vendor library
+  reports without a length. A marker no publish has placed yet is owed to the first sample a
+  later publish places, and a later loss joins it as one marker there, because a reader that
+  merges the tags of one sample keeps the later count alone. A marker the output port
+  had no room for is counted, and every source reports the count, because a stream missing
+  its marker reads as a continuous one.
 - A discontinuity marker sits at the head of the block the gap falls in front of. A ring
   that refuses the newest chunk refuses only while it is full, so the samples it sheds come
   after every sample already in it: the loss is noticed on one block and belongs to the
@@ -156,7 +162,8 @@ while the device is open reaches nothing.
   behind it would label them with a rate they were not taken at and time them by it as well.
   The block already drained out of a ring is dropped too: the publish holds and retries and
   applies staged settings inside its own loop, so it carries the stream's own generation and
-  abandons a block whose generation has passed. A marker names which of the three made the
+  abandons a block whose generation has passed. The publish answers how much of the block it
+  handed over, and the part it abandoned is counted as lost. A marker names which of the three made the
   hole: a buffer that ran over, a packet the link lost, or the block's own drain across the
   change. A write the device refuses leaves the setting on the rate the device still holds,
   read back from it, because a stream counted at a rate the radio never took reads the
@@ -606,7 +613,10 @@ request and calls `processScheduledMessages()` on the model from its own thread.
   while paused, and `stopped` otherwise. `streamStateReading()` states it under
   `rx_stream_state` or `tx_stream_state`, brief, and good while streaming. The analog
   bandwidth, `rx_analog_bandwidth`, is a family's own reading, built by
-  `analogBandwidthReading()` as whole hertz and read back by `analogBandwidthIn()`.
+  `analogBandwidthReading()` as whole hertz and read back by `analogBandwidthIn()`. Every
+  source states the samples it lost, `rx_dropped_samples`, brief, and after it the tags its
+  port refused, `rx_dropped_markers`, not brief, built by `droppedSamplesReading()` and
+  `droppedMarkersReading()`. A count has no pass or fail sense and reads good.
 - A descriptor map carries `id`, `label` and `unit` as strings, `kind` as a 32-bit integer,
   `min`, `max`, `step`, `default` and `inoperative_above_hz` as numbers, `options` as a list
   of strings, `list_values` as a list of numbers, `is_gain`, `rate_derived`, `session_only`

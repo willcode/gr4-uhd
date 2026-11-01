@@ -67,6 +67,7 @@ if(CAPTURE_UHD_FOUND)
           controls.uhd-a-sensors-read-answers-from-the-cache
           controls.uhd-a-retune-forwards-nothing-ahead-of-its-samples controls.uhd-a-retune-tag-lands-on-the-first-sample-it-reached
           controls.uhd-an-overflow-during-a-retune-is-named-for-it controls.uhd-a-shed-no-counter-explains-is-marked
+          controls.uhd-a-gap-marker-counts-what-the-stamps-measure
           controls.uhd-stamps-off-the-sample-grid-count-only-lost-samples
           controls.uhd-a-receive-asks-for-whole-frames
           controls.uhd-a-refused-clock-range-keeps-the-clock controls.uhd-the-transport-keys-follow-the-direction

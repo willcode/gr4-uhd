@@ -389,17 +389,22 @@ inline void appendRateAndFrequency(std::vector<ControlDesc>& surface, std::vecto
     }
 }
 
-/*| role: the ids of the two readings a block states from its own state and the filter it
+/*| role: the ids of the readings a block states from its own state and the filter it
         holds, beside the readings of its device.
     contract: the stream state is one of the words below. good is true for streaming alone,
         so a caller reads whether the device is up from that flag. A source states it under
         rx_stream_state and a sink under tx_stream_state. The analog bandwidth is the width
         of the analog filter in force, in hertz, stated by a source whose family states one
         and absent from every other.
+    contract: every source states rx_dropped_samples, the samples this host lost since the
+        stream started, on a glance row, and then rx_dropped_markers, the tags its output
+        port had no room for, on a detail row. Both are counts and read good.
 */
 inline constexpr const char* kStreamStateReading     = "rx_stream_state";
 inline constexpr const char* kTxStreamStateReading   = "tx_stream_state";
 inline constexpr const char* kAnalogBandwidthReading = "rx_analog_bandwidth";
+inline constexpr const char* kDroppedSamplesReading  = "rx_dropped_samples";
+inline constexpr const char* kDroppedMarkersReading  = "rx_dropped_markers";
 
 /*| contract: the id of the reading a block that answers the sensors property from a cache adds
         to a whole answer made before a whole sweep has landed. Such an answer carries the brief
@@ -423,6 +428,12 @@ inline constexpr const char* kFailed    = "failed";
 
 // The analog bandwidth reading, the width in whole hertz followed by the unit.
 inline SensorReading analogBandwidthReading(double hz) { return {.id = kAnalogBandwidthReading, .label = "Analog bandwidth", .value = std::format("{:.0f} Hz", hz), .good = true, .brief = true}; }
+
+// The dropped samples reading, a glance row.
+inline SensorReading droppedSamplesReading(std::uint64_t samples) { return {.id = kDroppedSamplesReading, .label = "Dropped samples", .value = std::format("{}", samples), .good = true, .brief = true}; }
+
+// The lost markers reading, a detail row.
+inline SensorReading droppedMarkersReading(std::size_t markers) { return {.id = kDroppedMarkersReading, .label = "Lost markers", .value = std::format("{}", markers), .good = true, .brief = false}; }
 
 /*| contract: the analog bandwidth a reading set states, in hertz, and nothing where the set
         carries no such reading or its value does not start with a number.

@@ -2251,6 +2251,22 @@ int main(int argc, char** argv) {
         expect(!Source::gapMarkerFor(false, Source::kGapBufferOverrun, 0UL, true).has_value()) << "a block that follows the last without a gap carries no marker";
     });
 
+    cases("controls.uhd-a-gap-marker-counts-what-the-stamps-measure", [] {
+        using capture::uhd::Source;
+        using Spec           = ::uhd::time_spec_t;
+        constexpr double hz  = 2.0e6;
+        const Spec       end = Spec(10, 0.5);
+        // The block's stamp says 1068 samples are missing after the end of the one before it.
+        const std::uint64_t shed = Source::shedForBlock(true, false, hz, hz, end, end + Spec(1068.0 / hz));
+        expect(shed == 1068UL) << "the stamps measure the shed";
+        expect(Source::markerCountFor(true, true, false, hz, hz, shed) == std::optional<std::uint64_t>(shed)) << "and the marker carries what they measure";
+        expect(Source::markerCountFor(true, true, false, hz, hz, 0UL) == std::optional<std::uint64_t>(0UL)) << "an overflow the stamps show lost nothing carries a count of zero";
+        expect(!Source::markerCountFor(false, true, false, hz, hz, shed).has_value()) << "a block with no stamp carries no count";
+        expect(!Source::markerCountFor(true, false, false, hz, hz, shed).has_value()) << "nor the first block of a stream";
+        expect(!Source::markerCountFor(true, true, true, hz, hz, shed).has_value()) << "nor a block while a device-clock set is in flight";
+        expect(!Source::markerCountFor(true, true, false, hz, 1.0e6, shed).has_value()) << "nor one measured against another rate";
+    });
+
     cases("controls.uhd-stamps-off-the-sample-grid-count-only-lost-samples", [] {
         using Block = StampedStream::Block;
         using Spec  = ::uhd::time_spec_t;

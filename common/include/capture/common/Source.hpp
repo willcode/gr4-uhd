@@ -115,7 +115,9 @@ void publishOutputTag(Block& blk, TagMap&& tagMap, std::size_t offset) {
         the cause beside it where the caller names one. gr:rx_overflow says a gap occurred and
         rx_overflow_cause names what caused it; a caller naming nothing publishes the key alone.
     contract: where the caller counts the samples the gap lost, gr:n_dropped_samples carries
-        the count as a gr::Size_t, held at that type's largest value.
+        the count as a gr::Size_t, held at that type's largest value. The count holds the
+        samples lost since the last marker. A stream's counts sum to the loss its markers
+        cover.
     frame: a cause is a short phrase in the device library's words, "restart" or "lost packet".
         The count is in samples of one output port.
     verified-by: publish.a-marker-carries-the-cause-where-one-is-named
@@ -132,6 +134,38 @@ void emitOverflowTag(Block& blk, std::string_view cause = {}, std::optional<std:
         gr::tag::put(tagMap, gr::tag::N_DROPPED_SAMPLES, static_cast<gr::Size_t>(std::min<std::uint64_t>(*droppedSamples, std::numeric_limits<gr::Size_t>::max())));
     }
     publishOutputTag(blk, std::move(tagMap), 0UZ);
+}
+
+/*| contract: owe a gap marker to the first sample the next publish places, with the cause and
+        the count emitOverflowTag takes. A marker already owed takes the later cause and adds
+        this count to its own. It carries no count where either part has none.
+    frame: the cause is a string of static storage, a literal, or null for none.
+    why: a marker published ahead of a publish that places nothing falls on the sample the
+        next marker falls on. A reader that merges one sample's tags keeps the later count
+        alone.
+    verified-by: publish.an-owed-marker-goes-out-once-with-every-count
+*/
+template <typename Block>
+void oweOverflowTag(Block& blk, const char* cause, std::optional<std::uint64_t> droppedSamples) {
+    auto& state = blk._outputState;
+    if (state.gapOwed) {
+        state.gapCount = state.gapCount.has_value() && droppedSamples.has_value() ? std::optional<std::uint64_t>(*state.gapCount + *droppedSamples) : std::nullopt;
+    } else {
+        state.gapCount = droppedSamples;
+    }
+    state.gapCause = cause;
+    state.gapOwed  = true;
+}
+
+// Publish the owed gap marker, where one is owed, on the sample at the writer's position.
+template <typename Block>
+void placeOwedOverflowTag(Block& blk) {
+    auto& state = blk._outputState;
+    if (!state.gapOwed) {
+        return;
+    }
+    state.gapOwed = false;
+    emitOverflowTag(blk, state.gapCause != nullptr ? std::string_view(state.gapCause) : std::string_view{}, state.gapCount);
 }
 
 /*| contract: publish the tags the first sample of a block carries. The first block a stream
@@ -233,8 +267,9 @@ bool awaitProgress(Block& blk, std::size_t seen, std::size_t edgeSamples) {
     contract: no delivered sample is dropped. On a full edge the call waits through
         awaitProgress, applies the staged settings, and retries until the block is out or
         keepGoing() answers false. keepGoing is the caller's stop test. tWallNs is read once by
-        the caller and stamps the whole block. The first sample of each block carries the tags
-        publishBlockHeadTags places.
+        the caller and stamps the whole block. The first sample of each block carries the owed
+        gap marker and the tags publishBlockHeadTags places. The answer is the samples
+        published, which falls short of the block only where keepGoing() answered false.
     invariant: staged settings are applied here, on the streaming thread, and never on the
         scheduler's. A device source holds this only while its work() override returns without
         reaching the base class's work path.
@@ -245,7 +280,7 @@ bool awaitProgress(Block& blk, std::size_t seen, std::size_t edgeSamples) {
     verified-by: publish.block-longer-than-the-edge
 */
 template <typename Block, typename KeepGoing>
-void holdAndPublish(Block& blk, std::span<const std::complex<float>> samples, std::uint64_t tWallNs, KeepGoing keepGoing) {
+std::size_t holdAndPublish(Block& blk, std::span<const std::complex<float>> samples, std::uint64_t tWallNs, KeepGoing keepGoing) {
     auto&             writer = blk.out.streamWriter();
     const std::size_t n      = samples.size();
     std::size_t       done   = 0UZ;
@@ -266,6 +301,7 @@ void holdAndPublish(Block& blk, std::span<const std::complex<float>> samples, st
                 nCopy = std::min(n - done, span.size());
                 std::memcpy(span.data(), samples.data() + done, nCopy * sizeof(std::complex<float>));
                 if (done == 0UZ) {
+                    placeOwedOverflowTag(blk);
                     publishBlockHeadTags(blk, tWallNs);
                 }
                 span.publish(nCopy);
@@ -280,6 +316,7 @@ void holdAndPublish(Block& blk, std::span<const std::complex<float>> samples, st
         blk.progress->incrementAndGet();
         blk.progress->notify_all();
     }
+    return done;
 }
 
 } // namespace capture
